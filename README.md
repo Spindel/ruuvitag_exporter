@@ -35,3 +35,29 @@ share your changes with the users. Not a very difficult requirement.
 I documented this in the past [over at work](https://www.modio.se/cross-compiling-rust-binaries-to-armv7.html)
 
 The steps there are still relevant, I had to look them up to cross compile this.
+
+# Cross compiling for aarch64
+
+The process is the same as armv7, but the packages and targets are different:
+
+
+Use podman to run the official rust container:
+
+    podman run --rm -ti -v $(pwd):/code:rw,z --workdir /code docker.io/library/rust:latest
+
+Inside, add the target, and necessary debian packages to cross compile
+
+    rustup target add aarch64-unknown-linux-gnu
+    dpkg --add-architecture arm64
+    apt update
+    apt install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu  libdbus-1-dev:arm64 libc6-dev-arm64-cross
+
+Export the environment variables to make it useful:
+
+    export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig/ 
+    export PKG_CONFIG_ALLOW_CROSS="true"
+
+
+Then build:
+
+    cargo build --target aarch64-unknown-linux-gnu --release
