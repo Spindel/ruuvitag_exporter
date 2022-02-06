@@ -27,7 +27,7 @@ to making that a command line argument, but I didn't want to bother
 
 License: Since it's a network service, I licensed it under Affero GPLv3. In
 short, it means that if you fork it, modify it, and use it, you still need to
-share your changes with the users. Not a very difficuly requirement.
+share your changes with the users. Not a very difficult requirement.
 
 
 # cross compiling for armv7
