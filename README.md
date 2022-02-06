@@ -28,3 +28,10 @@ to making that a command line argument, but I didn't want to bother
 License: Since it's a network service, I licensed it under Affero GPLv3. In
 short, it means that if you fork it, modify it, and use it, you still need to
 share your changes with the users. Not a very difficuly requirement.
+
+
+# cross compiling for armv7
+
+I documented this in the past [over at work](https://www.modio.se/cross-compiling-rust-binaries-to-armv7.html)
+
+The steps there are still relevant, I had to look them up to cross compile this.
