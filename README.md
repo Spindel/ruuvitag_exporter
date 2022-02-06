@@ -1,2 +1,30 @@
-# ruuvitag_exporter
-A ruuvitag prometheus exporter written in Rust
+# Ruuvitag Prometheus Exporter
+
+So I wanted my ruuvitags in Grafana for monitoring, and since I did not find a
+proper version of it, I thought I'd build one myself.
+
+This is my ruuvitag exporter, it uses:
+
+- [blteplug](https://github.com/deviceplug/btleplug) for the BLE stack. 
+  This means it needs a C compiler and headers to build. I might fix that.
+
+- [ruuvi-sensor-protocol-rs](https://github.com/lautat/ruuvi-sensor-protocol-rs) To decode the ruuvitag data
+
+- [rust-prometheus](https://github.com/tikv/rust-prometheus) for the prometheus parts.
+
+- [hyper](https://hyper.rs/) for the simple http1.1 server
+
+- [tokio](https://tokio.rs/) For the async runtime
+
+- [tracing](https://tracing.rs/tracing/)  for the logging and tracing
+  (Because I wanted to experiment)
+
+
+
+It's made to run in a container, so it always listens on 0.0.0.0:9185 I'm open
+to making that a command line argument, but I didn't want to bother
+
+
+License: Since it's a network service, I licensed it under Affero GPLv3. In
+short, it means that if you fork it, modify it, and use it, you still need to
+share your changes with the users. Not a very difficuly requirement.
