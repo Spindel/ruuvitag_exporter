@@ -43,7 +43,7 @@ mod prom {
 
     lazy_static! {
         static ref TEMPERATURE: GaugeVec =
-            register_gauge_vec!(opts!("temperature", "Temperature in Celsius?", labels!("unit" => "Cel")), &["mac"]).expect("Failed to initialize");
+            register_gauge_vec!(opts!("temperature", "Temperature in Celsius", labels!("unit" => "Cel")), &["mac"]).expect("Failed to initialize");
 
         static ref HUMIDITY: GaugeVec =
             register_gauge_vec!(opts!("humidity", "Humidity in percent", labels!("unit" => "%RH")), &["mac"]).expect("Failed to initialize");
@@ -87,7 +87,7 @@ mod prom {
                 let inner = seen.entry(mac).or_insert(0u32);
                 if *inner != count {
                     *inner = count;
-                    // We havent seen it recently
+                    // We haven't seen it recently
                     register_sensor(&sensor);
                 }
             }
@@ -101,7 +101,7 @@ mod prom {
             Acceleration, BatteryPotential, Humidity, MovementCounter, Pressure, Temperature,
             TransmitterPower,
         };
-        // It is important that the keys in the span match what se use ".record" below.
+        // It is important that the keys in the span match what we use in `span.record("key",...)` below.
         let span = span!(
             Level::INFO,
             "register_data",
@@ -189,20 +189,20 @@ mod serve {
 
     lazy_static! {
         static ref HTTP_COUNTER: IntCounter = register_int_counter!(
-            "ruuvi_expirter_requests_total",
+            "ruuvi_exporter_requests_total",
             "Number of HTTP requests received."
         )
-        .expect("can not create HTTP_COUNTER metric. this should never fail");
+        .expect("Could not create HTTP_COUNTER metric. This should never fail.");
         static ref HTTP_BODY_GAUGE: IntGauge = register_int_gauge!(
             "ruuvi_exporter_response_size_bytes",
             "The HTTP response sizes in bytes."
         )
-        .expect("can not create HTTP_BODY_GAUGE metric. this should never fail");
+        .expect("Could not create HTTP_BODY_GAUGE metric. This should never fail.");
         static ref HTTP_REQ_HISTOGRAM: Histogram = register_histogram!(
             "ruuvi_exporter_request_duration_seconds",
             "The HTTP request latencies in seconds."
         )
-        .expect("can not create HTTP_REQ_HISTOGRAM metric. this should never fail");
+        .expect("Could not create HTTP_REQ_HISTOGRAM metric. This should never fail.");
     }
 
     #[tracing::instrument]
@@ -242,7 +242,7 @@ mod serve {
         Ok(resp)
     }
 
-    fn four_oh_four() -> Result<Response<Body>, hyper::http::Error> {
+    fn four_oh_four() -> Result<Response<Body>, Error> {
         debug!(message = "Redirecting user", status = 404);
         let resp = Response::builder().status(404).body(Body::empty())?;
         Ok(resp)
@@ -292,7 +292,7 @@ async fn ruuvi_emitter(
         let enter = span.enter();
         info!(message = "Starting scan on", adapter = ?central, timeout = ?MINUTE);
         central.start_scan(ScanFilter::default()).await?;
-        // We use the timeout to restart the bluetooth scan if we don't see any friends
+        // We use the timeout to restart the scan if we don't see any events
         while let Ok(Some(event)) = timeout(MINUTE, events.next()).await {
             match event {
                 CentralEvent::ManufacturerDataAdvertisement {
@@ -327,7 +327,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let manager = Manager::new().await?;
 
-    // get the first bluetooth adapter
+    // Get the first Bluetooth adapter
     // connect to the adapter
     let central = get_central(&manager).await?;
 
@@ -342,7 +342,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // When the event listener exits, we terminate.
     let res = ruuvi_emitter(central.clone(), tx).await;
-    // Stop scanning so we don't leave bluetooth in scan mode.
+    // Stop scanning so we don't leave the adapter in scan mode.
     central.stop_scan().await?;
     for t in to_kill {
         t.abort();
