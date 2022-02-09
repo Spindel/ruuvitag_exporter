@@ -29,16 +29,16 @@ fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> 
 }
 
 mod prom {
-    use lazy_static::lazy_static;
-    use tokio::sync::mpsc;
-    use std::collections::HashMap;
     use btleplug::api::BDAddr;
+    use lazy_static::lazy_static;
     use prometheus::{self, GaugeVec, IntCounterVec, IntGaugeVec};
     use prometheus::{
         labels, opts, register_gauge_vec, register_int_counter_vec, register_int_gauge_vec,
     };
     use ruuvi_sensor_protocol::SensorValues;
     use ruuvi_sensor_protocol::{MacAddress, MeasurementSequenceNumber};
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
     use tracing::{info, span, warn, Level};
 
     lazy_static! {
@@ -96,11 +96,11 @@ mod prom {
     }
 
     fn register_sensor(sensor: &SensorValues) {
-        use tracing::field;
         use ruuvi_sensor_protocol::{
             Acceleration, BatteryPotential, Humidity, MovementCounter, Pressure, Temperature,
             TransmitterPower,
         };
+        use tracing::field;
         // It is important that the keys in the span match what we use in `span.record("key",...)` below.
         let span = span!(
             Level::INFO,
