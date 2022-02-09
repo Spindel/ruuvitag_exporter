@@ -324,6 +324,10 @@ async fn ruuvi_emitter(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "0.0.0.0:9185".to_string());
+    let address: SocketAddr = addr.parse()?;
 
     let manager = Manager::new().await?;
 
@@ -332,7 +336,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let central = get_central(&manager).await?;
 
     let (tx, rx) = mpsc::channel(100);
-    let address: SocketAddr = "0.0.0.0:9185".parse()?;
 
     // Tasks we want to clean up when we're done.
     let to_kill = vec![
