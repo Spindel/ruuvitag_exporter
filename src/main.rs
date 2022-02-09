@@ -8,7 +8,7 @@ use btleplug::platform::{Adapter, Manager};
 use ruuvi_sensor_protocol::SensorValues;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tracing::{info, span, warn, Level};
+use tracing::{error, info, span, warn, Level};
 
 async fn get_central(manager: &Manager) -> Result<Adapter, btleplug::Error> {
     let adapters = manager.adapters().await?;
@@ -29,16 +29,16 @@ fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> 
 }
 
 mod prom {
-    use lazy_static::lazy_static;
-    use tokio::sync::mpsc;
-    use std::collections::HashMap;
     use btleplug::api::BDAddr;
+    use lazy_static::lazy_static;
     use prometheus::{self, GaugeVec, IntCounterVec, IntGaugeVec};
     use prometheus::{
         labels, opts, register_gauge_vec, register_int_counter_vec, register_int_gauge_vec,
     };
     use ruuvi_sensor_protocol::SensorValues;
     use ruuvi_sensor_protocol::{MacAddress, MeasurementSequenceNumber};
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
     use tracing::{info, span, warn, Level};
 
     lazy_static! {
@@ -96,11 +96,11 @@ mod prom {
     }
 
     fn register_sensor(sensor: &SensorValues) {
-        use tracing::field;
         use ruuvi_sensor_protocol::{
             Acceleration, BatteryPotential, Humidity, MovementCounter, Pressure, Temperature,
             TransmitterPower,
         };
+        use tracing::field;
         // It is important that the keys in the span match what we use in `span.record("key",...)` below.
         let span = span!(
             Level::INFO,
@@ -320,10 +320,13 @@ async fn ruuvi_emitter(
         central.stop_scan().await?;
     }
 }
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "0.0.0.0:9185".to_string());
+    let address: SocketAddr = addr.parse()?;
 
     let manager = Manager::new().await?;
 
@@ -332,21 +335,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let central = get_central(&manager).await?;
 
     let (tx, rx) = mpsc::channel(100);
-    let address: SocketAddr = "0.0.0.0:9185".parse()?;
-
-    // Tasks we want to clean up when we're done.
-    let to_kill = vec![
-        tokio::spawn(prom::sensor_processor(rx)),
-        tokio::spawn(serve::webserver(address)),
-    ];
-
-    // When the event listener exits, we terminate.
-    let res = ruuvi_emitter(central.clone(), tx).await;
+    // Terminate if any of the tasks fail.
+    tokio::select!(
+        _ = tokio::spawn(prom::sensor_processor(rx)) => {error!(message = "Sensor processor failed")},
+        _ = tokio::spawn(serve::webserver(address))  => {error!(message = "Web server failed")},
+        // the btleplug can't move off thread, so don't spawn a task for it.
+        result = ruuvi_emitter(central.clone(), tx)  => {error!(message = "BLE scanning failed", result = ?result)},
+    );
     // Stop scanning so we don't leave the adapter in scan mode.
     central.stop_scan().await?;
-    for t in to_kill {
-        t.abort();
-        drop(t);
-    }
-    res
+    Ok(())
 }
