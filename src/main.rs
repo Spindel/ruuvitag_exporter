@@ -8,7 +8,7 @@ use btleplug::platform::{Adapter, Manager};
 use ruuvi_sensor_protocol::SensorValues;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tracing::{info, span, warn, Level};
+use tracing::{error, info, span, warn, Level};
 
 async fn get_central(manager: &Manager) -> Result<Adapter, btleplug::Error> {
     let adapters = manager.adapters().await?;
@@ -320,7 +320,6 @@ async fn ruuvi_emitter(
         central.stop_scan().await?;
     }
 }
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
@@ -336,20 +335,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let central = get_central(&manager).await?;
 
     let (tx, rx) = mpsc::channel(100);
-
-    // Tasks we want to clean up when we're done.
-    let to_kill = vec![
-        tokio::spawn(prom::sensor_processor(rx)),
-        tokio::spawn(serve::webserver(address)),
-    ];
-
-    // When the event listener exits, we terminate.
-    let res = ruuvi_emitter(central.clone(), tx).await;
+    // Terminate if any of the tasks fail.
+    tokio::select!(
+        _ = tokio::spawn(prom::sensor_processor(rx)) => {error!(message = "Sensor processor failed")},
+        _ = tokio::spawn(serve::webserver(address))  => {error!(message = "Web server failed")},
+        // the btleplug can't move off thread, so don't spawn a task for it.
+        result = ruuvi_emitter(central.clone(), tx)  => {error!(message = "BLE scanning failed", result = ?result)},
+    );
     // Stop scanning so we don't leave the adapter in scan mode.
     central.stop_scan().await?;
-    for t in to_kill {
-        t.abort();
-        drop(t);
-    }
-    res
+    Ok(())
 }
