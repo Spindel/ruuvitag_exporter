@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-btleplug = { version = "0.9" }
+btleplug = { version = "0.10" }
 tokio = { version = "1", features = ["time", "sync", "rt", "macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 ruuvi-sensor-protocol = "0.5.0"
