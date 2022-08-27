@@ -329,7 +329,8 @@ use zbus::Connection;
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
-    let connection = Connection::system().await?;
+    let mut connection = Connection::system().await?;
+    connection.set_max_queued(25600);
 
     async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
         use zbus::ProxyDefault;
@@ -395,6 +396,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .cache_properties(zbus::CacheProperties::Yes)
                 .build()
                 .await?;
+
             println!(
                 "dev adapter= {:?}  addr={}",
                 device.adapter().await?,
@@ -425,28 +427,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let _devices = find_devices(&connection).await?;
     use tokio_stream::StreamMap;
-    let mut map = StreamMap::new();
-    for (dev, _) in _devices {
+    let mut prop_stream = StreamMap::new();
+    let mut sig_stream = StreamMap::new();
+    for (dev, _) in &_devices {
         //        let stream = dev.receive_all_signals().await?;
         let path = dev.path().to_owned();
         let dest = dev.destination().to_owned();
         println!("{}, {}", &path, &dest);
+
         let props = zbus::fdo::PropertiesProxy::builder(&connection)
             .destination("org.bluez")?
-            //                .cache_properties(zbus::CacheProperties::Yes)
+            .cache_properties(zbus::CacheProperties::Yes)
             .path(path)?
             .build()
             .await?;
         println!("device={:?}, {:?}", props.path(), props.interface());
-        for (k, v) in props.get_all(props.interface().to_owned()).await? {
-            println!("{:?} == {:?}", k, v);
+        for (k, v) in props.get_all(dev.interface().to_owned()).await? {
+            println!("Property {:?} == {:?}", k, v);
         }
         //
         let mut stream = props.receive_properties_changed().await?;
+        println!("Meeeh got stream");
         //        let stream = dev.receive_rssi_changed().await;
         let key = dev.path().to_owned();
-        map.insert(key, stream);
+        prop_stream.insert(key, stream);
     }
+
+    println!("Meeeh, no stream");
+    for (dev, _) in &_devices {
+        let path = dev.path().to_owned();
+        let dest = dev.destination().to_owned();
+        let iface = dev.interface().to_owned();
+        println!(
+            "Setting up receive on all signals, device={:?}, dest={:?}, iface={:?}",
+            path, dest, iface
+        );
+        //let stream = dev.receive_all_signals().await?;
+        let stream = dev.receive_rssi_changed().await;
+        let key = dev.path().to_owned();
+        dbg!(&stream);
+        sig_stream.insert(key, stream);
+    }
+    println!("meeh about to manage some proies");
 
     // Lets try to get some changes on the devices
     let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
@@ -474,12 +496,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         },
         async {
-            while let Some((k, v)) = map.next().await {
+            while let Some((k, v)) = prop_stream.next().await {
                 // println!("Something happened: {:?}", v);
                 let args = v.args().unwrap();
                 for (name, value) in args.changed_properties().iter() {
-                    println!("Signalmap: k={} {:?} to {:?}", &k, &name, &value);
+                    println!("PropertyChanged: k={} {:?} to {:?}", &k, &name, &value);
                 }
+                /*
+                 let payload = v.get().await.unwrap();
+                println!("Signal: {:?} payload {:?}", v.name(), payload);
+                */
+            }
+        },
+        async {
+            while let Some((k, v)) = sig_stream.next().await {
+                // println!("Something happened: {:?}", v);
+                println!("device Signal: k={} {:?}", &k, &v.get().await.unwrap());
                 /*
                  let payload = v.get().await.unwrap();
                 println!("Signal: {:?} payload {:?}", v.name(), payload);
