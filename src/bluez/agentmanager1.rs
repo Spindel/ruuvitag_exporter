@@ -17,6 +17,7 @@
 //!
 //! …consequently `zbus-xmlgen` did not generate code for the above interfaces.
 
+#![allow(non_snake_case)]
 use zbus::dbus_proxy;
 
 #[dbus_proxy(interface = "org.bluez.AgentManager1")]
