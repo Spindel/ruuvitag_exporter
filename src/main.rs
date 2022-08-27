@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 mod bluez;
 use bluez::adapter1::Adapter1Proxy;
+use bluez::device1::Device1Proxy;
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral};
 use btleplug::platform::{Adapter, Manager};
@@ -329,13 +330,81 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
     let connection = Connection::system().await?;
-    let proxy = Adapter1Proxy::builder(&connection)
-        .destination("org.bluez")?
-        .path("/org/bluez/hci0")?
-        .build()
-        .await?;
-    let addr = proxy.address().await?;
+
+    async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
+        use zbus::ProxyDefault;
+        let mut result: Vec<Adapter1Proxy> = Vec::new();
+
+        let p = zbus::fdo::ObjectManagerProxy::builder(&connection)
+            .destination("org.bluez")?
+            .path("/")?
+            .build()
+            .await?;
+        let managed = p.get_managed_objects().await?;
+
+        for (path, children) in &managed {
+            for (interface, _props) in children {
+                // This will print the found paths, devices and their metadata
+                // println!("path={:?} interface={} muh={:?}", &path, interface, _props);
+                if interface.as_str() == Adapter1Proxy::INTERFACE {
+                    let adapter = Adapter1Proxy::builder(&connection)
+                        .destination("org.bluez")?
+                        .path(path.clone())?
+                        .build()
+                        .await?;
+                    result.push(adapter);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    use zbus::zvariant::OwnedValue;
+    type Properties = HashMap<String, OwnedValue>;
+    /// Get a list of all Bluetooth devices which have been discovered so far.
+    async fn find_devices(
+        connection: &zbus::Connection,
+    ) -> zbus::Result<Vec<(Device1Proxy, Properties)>> {
+        use zbus::ProxyDefault;
+        let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
+            .destination("org.bluez")?
+            .path("/")?
+            .build()
+            .await?;
+        let tree = bluez_root.get_managed_objects().await?;
+        use zbus::zvariant::OwnedObjectPath;
+
+        // Filter down to only the pairs that match our interface
+        let devices: Vec<(OwnedObjectPath, Properties)> = tree
+            .into_iter()
+            .filter_map(|(object_path, mut children)| {
+                match children.remove(Device1Proxy::INTERFACE) {
+                    Some(data) => Some((object_path.clone(), data)),
+                    None => None,
+                }
+            })
+            .collect();
+
+        // Return the mappings of proxy types + properties in case someone cares.
+        let mut result: Vec<(Device1Proxy, Properties)> = Vec::new();
+        for (object_path, blob) in devices {
+            let device = Device1Proxy::builder(&connection)
+                .destination("org.bluez")?
+                .path(object_path)?
+                .build()
+                .await?;
+            result.push((device, blob));
+        }
+        Ok(result)
+    }
+
+    let mut adapters = find_adapters(&connection).await?;
+    let adapter = adapters.pop().unwrap();
+
+    let addr = adapter.address().await?;
     println!("We have a hci address: {}", addr);
+
+    let _devices = find_devices(&connection).await?;
 
     let manager = Manager::new().await?;
 
