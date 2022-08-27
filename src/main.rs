@@ -3,6 +3,7 @@ use std::error::Error;
 use std::net::SocketAddr;
 
 mod bluez;
+use bluez::adapter1::Adapter1Proxy;
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral};
 use btleplug::platform::{Adapter, Manager};
@@ -322,10 +323,19 @@ async fn ruuvi_emitter(
         central.stop_scan().await?;
     }
 }
-
+use zbus::Connection;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
+
+    let connection = Connection::system().await?;
+    let proxy = Adapter1Proxy::builder(&connection)
+        .destination("org.bluez")?
+        .path("/org/bluez/hci0")?
+        .build()
+        .await?;
+    let addr = proxy.address().await?;
+    println!("We have a hci address: {}", addr);
 
     let manager = Manager::new().await?;
 
