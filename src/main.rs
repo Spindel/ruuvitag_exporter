@@ -361,6 +361,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     use zbus::zvariant::OwnedValue;
     type Properties = HashMap<String, OwnedValue>;
+    use zbus::fdo::PropertiesProxy;
     /// Get a list of all Bluetooth devices which have been discovered so far.
     async fn find_devices(
         connection: &zbus::Connection,
@@ -391,8 +392,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let device = Device1Proxy::builder(&connection)
                 .destination("org.bluez")?
                 .path(object_path)?
+                .cache_properties(zbus::CacheProperties::Yes)
                 .build()
                 .await?;
+            println!(
+                "dev adapter= {:?}  addr={}",
+                device.adapter().await?,
+                device.address().await?
+            );
+            if let Ok(manuf_data) = device.manufacturer_data().await {
+                println!("manuf_data={:?}", manuf_data);
+            };
             result.push((device, blob));
         }
         Ok(result)
@@ -414,6 +424,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("We have a hci address: {}", addr);
 
     let _devices = find_devices(&connection).await?;
+    use tokio_stream::StreamMap;
+    let mut map = StreamMap::new();
+    for (dev, _) in _devices {
+        //        let stream = dev.receive_all_signals().await?;
+        let path = dev.path().to_owned();
+        let dest = dev.destination().to_owned();
+        println!("{}, {}", &path, &dest);
+        let props = zbus::fdo::PropertiesProxy::builder(&connection)
+            .destination("org.bluez")?
+            //                .cache_properties(zbus::CacheProperties::Yes)
+            .path(path)?
+            .build()
+            .await?;
+        println!("device={:?}, {:?}", props.path(), props.interface());
+        for (k, v) in props.get_all(props.interface().to_owned()).await? {
+            println!("{:?} == {:?}", k, v);
+        }
+        //
+        let mut stream = props.receive_properties_changed().await?;
+        //        let stream = dev.receive_rssi_changed().await;
+        let key = dev.path().to_owned();
+        map.insert(key, stream);
+    }
 
     // Lets try to get some changes on the devices
     let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
@@ -423,21 +456,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
     let mut added = bluez_root.receive_interfaces_added().await?;
     let mut removed = bluez_root.receive_interfaces_removed().await?;
+    //   let mut allsig = dbus_proxy.receive_all_signals().await?;
 
     tokio::join!(
         async {
             while let Some(v) = added.next().await {
                 // println!("Something happened: {:?}", v);
-                println!("Added: {:?}", &v);
-                println!("Added: {:?}", v.args().unwrap());
+                //           println!("Added: {:?}", &v);
+                //                println!("Added: {:?}", v.args().unwrap());
             }
         },
         async {
             while let Some(v) = removed.next().await {
                 // println!("Something happened: {:?}", v);
-                println!("Removed: {:?}", &v);
+                //                println!("Removed: {:?}", &v);
+                //              println!("Removed: {:?}", v.args().unwrap());
             }
-        }
+        },
+        async {
+            while let Some((k, v)) = map.next().await {
+                // println!("Something happened: {:?}", v);
+                let args = v.args().unwrap();
+                for (name, value) in args.changed_properties().iter() {
+                    println!("Signalmap: k={} {:?} to {:?}", &k, &name, &value);
+                }
+                /*
+                 let payload = v.get().await.unwrap();
+                println!("Signal: {:?} payload {:?}", v.name(), payload);
+                */
+            }
+        },
     );
 
     // All done, shut down
