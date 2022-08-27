@@ -400,11 +400,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut adapters = find_adapters(&connection).await?;
     let adapter = adapters.pop().unwrap();
+    adapter.set_powered(true).await?;
+    // discovery filter is a map str=>val with fixed keys
+    // see
+    //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
+    // and
+    //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
+    //
+    adapter.set_discovery_filter(HashMap::new()).await?;
+    adapter.start_discovery().await?;
 
     let addr = adapter.address().await?;
     println!("We have a hci address: {}", addr);
 
     let _devices = find_devices(&connection).await?;
+
+    // Lets try to get some changes on the devices
+    let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
+        .destination("org.bluez")?
+        .path("/")?
+        .build()
+        .await?;
+    let mut added = bluez_root.receive_interfaces_added().await?;
+    let mut removed = bluez_root.receive_interfaces_removed().await?;
+
+    tokio::join!(
+        async {
+            while let Some(v) = added.next().await {
+                // println!("Something happened: {:?}", v);
+                println!("Added: {:?}", &v);
+                println!("Added: {:?}", v.args().unwrap());
+            }
+        },
+        async {
+            while let Some(v) = removed.next().await {
+                // println!("Something happened: {:?}", v);
+                println!("Removed: {:?}", &v);
+            }
+        }
+    );
+
+    // All done, shut down
+    adapter.stop_discovery().await?;
 
     let manager = Manager::new().await?;
 
