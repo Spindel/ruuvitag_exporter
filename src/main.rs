@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
 
+mod bluez;
+
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral};
 use btleplug::platform::{Adapter, Manager};
 
