@@ -404,16 +404,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 device.address().await?
             );
             if let Ok(manuf_data) = device.manufacturer_data().await {
-                println!("manuf_data conversion: {:?}", &manuf_data);
+                //println!("manuf_data conversion: {:?}", &manuf_data);
                 if let Some(sens) = from_manuf(manuf_data) {
-                    println!("Got data {:?}", sens);
-                } else {
-                    println!("manuf_data convert failed");
+                    println!("Ruuvi data {:?}", sens);
                 }
             };
-            if let Ok(rssi) = device.get_property::<i16>("RSSI").await {
-                println!("rssi={:?}", rssi);
-            };
+            /*
+             * Example of how to call the get_property and type-convert it without having a direct proxy
+                        if let Ok(rssi) = device.get_property::<i16>("RSSI").await {
+                            println!("rssi={:?}", rssi);
+                        };
+            */
 
             result.push((device, blob));
         }
@@ -469,12 +470,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let path = dev.path().to_owned();
         let dest = dev.destination().to_owned();
         let iface = dev.interface().to_owned();
+
+        let devaddr = dev.address().await?;
+        let devname = dev.name().await.ok();
         println!(
-            "Setting up receive rssi signal, device={:?}, dest={:?}, iface={:?}",
-            path, dest, iface
+            "Setting up receive manufacturer_data_changed signal, device={:?}, dest={:?}, iface={:?} name={:?} addr={:?}",
+            path, dest, iface, devname, devaddr
         );
         //let stream = dev.receive_all_signals().await?;
-        let stream = dev.receive_rssi_changed().await;
+        //        let stream = dev.receive_rssi_changed().await;
         let stream = dev.receive_manufacturer_data_changed().await;
         let key = dev.path().to_owned();
         //dbg!(&stream);
@@ -571,11 +575,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         async {
             while let Some((k, v)) = sig_stream.next().await {
                 // println!("Something happened: {:?}", v);
-                println!("device Signal: k={} {:?}", &k, &v.get().await.unwrap());
-                /*
-                 let payload = v.get().await.unwrap();
-                println!("Signal: {:?} payload {:?}", v.name(), payload);
-                */
+                //println!("Signal: {:?} payload {:?}", v.name(), payload);
+                if let Ok(val) = v.get().await {
+                    println!("device Signal: k={} {:?}", &k, &val);
+                    if let Some(sens) = from_manuf(val) {
+                        println!("Ruuvi data {:?}", sens);
+                    }
+                }
             }
         },
     );
