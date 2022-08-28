@@ -21,6 +21,8 @@
 #![allow(non_snake_case)]
 use zbus::dbus_proxy;
 
+use zbus::zvariant::Type;
+
 #[dbus_proxy(interface = "org.bluez.Device1")]
 trait Device1 {
     /// CancelPairing method
@@ -101,9 +103,7 @@ trait Device1 {
 
     /// ManufacturerData property
     #[dbus_proxy(property)]
-    fn manufacturer_data(
-        &self,
-    ) -> zbus::Result<std::collections::HashMap<u16, zbus::zvariant::OwnedValue>>;
+    fn manufacturer_data(&self) -> zbus::Result<std::collections::HashMap<u16, std::vec::Vec<u8>>>;
 
     /// Modalias property
     #[dbus_proxy(property)]
