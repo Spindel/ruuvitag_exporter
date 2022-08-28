@@ -331,11 +331,9 @@ mod mybus {
     use std::convert::From;
     use std::error::Error;
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
     type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, Device1Proxy<'device>>>>;
-    type TaskChannel = mpsc::Sender<tokio::task::JoinHandle<()>>;
 
     pub async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
         let mut result: Vec<Adapter1Proxy> = Vec::new();
@@ -416,12 +414,13 @@ mod mybus {
             }
         }
     }
+    use crate::SensorValues;
 
     pub async fn make_new_device(
         connection: &zbus::Connection,
         object_path: OwnedObjectPath,
-        task_write: &TaskChannel,
         pmap: &DeviceHash<'_>,
+        tx: tokio::sync::mpsc::Sender<SensorValues>,
     ) -> Result<(), Box<dyn Error>> {
         let device = Device1Proxy::builder(connection)
             .destination("org.bluez")?
@@ -432,19 +431,17 @@ mod mybus {
 
         println!("Setting up receive manufacturer_data_changed signal, device={:?}, dest={:?}, iface={:?} name={:?} addr={:?}", device.path(), device.destination(), device.interface(), device.name().await.ok(), device.address().await.ok());
 
+        let stream = device.receive_manufacturer_data_changed().await;
+        // Spawn a task to poll this device's stream
+        tokio::spawn(manufacturer_listener(stream, tx));
+        /*
         if let Ok(manuf_data) = device.manufacturer_data().await {
             //println!("manuf_data conversion: {:?}", &manuf_data);
             if let Some(sens) = from_manuf(manuf_data) {
                 println!("Ruuvi data {:?}", sens);
             }
-        };
-
-        let stream = device.receive_manufacturer_data_changed().await;
-        // Spawn a task and drop it on the floor.
-        // Maybe we should hand it off to something else later on
-        task_write
-            .send(tokio::spawn(manufacturer_listener(stream)))
-            .await?;
+        };*/
+        tokio::task::yield_now().await;
         let mut devices = pmap.lock().unwrap();
         if let Some(old) = devices.insert(object_path, device) {
             println!("There was alrady a device in there! {:?}", old);
@@ -456,7 +453,7 @@ mod mybus {
         mut added: zbus::fdo::InterfacesAddedStream<'_>,
         pmap: DeviceHash<'_>,
         connection: zbus::Connection,
-        task_write: TaskChannel,
+        tx: tokio::sync::mpsc::Sender<SensorValues>,
     ) {
         use tokio_stream::StreamExt;
         //                    Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
@@ -476,7 +473,7 @@ mod mybus {
                             _ => None,
                         });
                 if devdata.is_some() {
-                    make_new_device(&connection, hashpath, &task_write, &pmap)
+                    make_new_device(&connection, hashpath, &pmap, tx.clone())
                         .await
                         .unwrap();
                 }
@@ -486,6 +483,7 @@ mod mybus {
 
     pub async fn manufacturer_listener(
         mut stream: zbus::PropertyStream<'_, HashMap<u16, Vec<u8>>>,
+        tx: tokio::sync::mpsc::Sender<SensorValues>,
     ) {
         use tokio_stream::StreamExt;
         while let Some(v) = stream.next().await {
@@ -496,6 +494,7 @@ mod mybus {
                 if let Ok(val) = v.get().await {
                     if let Some(sens) = from_manuf(val) {
                         println!("Ruuvi data {:?}", sens);
+                        tx.send(sens).await.unwrap();
                     }
                 }
             }
@@ -511,7 +510,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     use mybus::signals_add_device;
     use mybus::singals_drop_device;
     use mybus::Device1Proxy;
-    use std::convert::From;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use zbus::zvariant::OwnedObjectPath;
@@ -524,8 +522,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Mapping of  the device path => device
     // Used so we can remove device proxies that are out of date.
     let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, Device1Proxy>::new()));
-
-    let (task_write, mut task_read) = mpsc::channel(100);
 
     let adapters = find_adapters(&connection).await?;
     for adapter in &adapters {
@@ -544,8 +540,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    let (tx, rx) = mpsc::channel(100);
     for object_path in find_devices(&connection).await? {
-        make_new_device(&connection, object_path, &task_write, &pmap).await?;
+        make_new_device(&connection, object_path, &pmap, tx.clone()).await?;
     }
 
     println!("meeh about to manage some proxies for the interface events");
@@ -561,29 +558,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //   let mut allsig = dbus_proxy.receive_all_signals().await?;
 
     tokio::try_join!(
-        async move {
-            // let mut tasks = Vec::new();
-            println!("Awaiting tasks");
-            while let Some(t) = task_read.recv().await {
-                println!("Awaiting t={:?}", t);
-                t.await;
-                /*
-                tasks.push(t);
-                let finished: usize = tasks.iter().map(|t| usize::from(t.is_finished())).sum();
-                println!(
-                    "New task arrived, tasks={} finished={}",
-                    tasks.len(),
-                    finished
-                );*/
-            }
-            Ok(())
-        },
         tokio::spawn(singals_drop_device(removed, pmap.clone())),
         tokio::spawn(signals_add_device(
             added,
             pmap.clone(),
             connection.clone(),
-            task_write.clone()
+            tx.clone()
         )),
     )
     .expect("Tried to fail");
@@ -610,7 +590,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // connect to the adapter
     let central = get_central(&manager).await?;
 
-    let (tx, rx) = mpsc::channel(100);
     let address: SocketAddr = "0.0.0.0:9185".parse()?;
 
     // Tasks we want to clean up when we're done.
