@@ -363,37 +363,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
     use zbus::zvariant::OwnedValue;
     type Properties = HashMap<String, OwnedValue>;
     use zbus::fdo::PropertiesProxy;
+    use zbus::zvariant::OwnedObjectPath;
+    use zbus::zvariant::Type;
+    use zbus::ProxyDefault; // Trait // Trait?
     /// Get a list of all Bluetooth devices which have been discovered so far.
     async fn find_devices(
         connection: &zbus::Connection,
-    ) -> zbus::Result<Vec<(Device1Proxy, Properties)>> {
-        use zbus::ProxyDefault;
+    ) -> zbus::Result<Vec<(OwnedObjectPath, Device1Proxy, Properties)>> {
         let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
             .destination("org.bluez")?
             .path("/")?
             .build()
             .await?;
         let tree = bluez_root.get_managed_objects().await?;
-        use zbus::zvariant::OwnedObjectPath;
 
         // Filter down to only the pairs that match our interface
         let devices: Vec<(OwnedObjectPath, Properties)> = tree
             .into_iter()
             .filter_map(|(object_path, mut children)| {
                 match children.remove(Device1Proxy::INTERFACE) {
-                    Some(data) => Some((object_path.clone(), data)),
+                    Some(data) => Some((object_path, data)),
                     None => None,
                 }
             })
             .collect();
 
         // Return the mappings of proxy types + properties in case someone cares.
-        let mut result: Vec<(Device1Proxy, Properties)> = Vec::new();
-        use zbus::zvariant::Type;
+        let mut result: Vec<(OwnedObjectPath, Device1Proxy, Properties)> = Vec::new();
         for (object_path, blob) in devices {
             let device = Device1Proxy::builder(&connection)
                 .destination("org.bluez")?
-                .path(object_path)?
+                .path(object_path.clone())?
                 .cache_properties(zbus::CacheProperties::Yes)
                 .build()
                 .await?;
@@ -416,7 +416,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         };
             */
 
-            result.push((device, blob));
+            result.push((object_path, device, blob));
         }
         Ok(result)
     }
@@ -441,7 +441,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //    let mut prop_stream = StreamMap::new();
     let mut sig_stream = StreamMap::new();
 
-    for (dev, _) in &_devices {
+    for (opath, dev, _) in &_devices {
         //        let stream = dev.receive_all_signals().await?;
         let path = dev.path().to_owned();
         let dest = dev.destination().to_owned();
@@ -466,7 +466,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("Meeeh, no stream");
-    for (dev, _) in &_devices {
+    for (opath, dev, _) in &_devices {
         let path = dev.path().to_owned();
         let dest = dev.destination().to_owned();
         let iface = dev.interface().to_owned();
@@ -496,7 +496,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut removed = bluez_root.receive_interfaces_removed().await?;
     //   let mut allsig = dbus_proxy.receive_all_signals().await?;
 
-    use zbus::ProxyDefault;
     tokio::join!(
         async {
             while let Some(v) = added.next().await {
@@ -541,8 +540,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if let Ok(data) = v.args() {
                     println!("Interfaces Removed: data={:?}", &data);
                     let path = data.object_path;
-                    for (dev, _) in &_devices {
-                        if dev.path() == &path {
+                    for (opath, dev, _) in &_devices {
+                        if &opath.as_ref() == &path {
                             if data.interfaces.contains(&dev.interface().as_str()) {
                                 println!("Should remove this dev {:?}", dev);
                                 /*  We can only read cached values here, thus it should be dropped.
