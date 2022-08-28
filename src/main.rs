@@ -359,7 +359,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Ok(result)
     }
-
+    use std::convert::From;
+    use std::sync::{Arc, Mutex};
     use zbus::zvariant::OwnedValue;
     type Properties = HashMap<String, OwnedValue>;
     use zbus::fdo::PropertiesProxy;
@@ -367,9 +368,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     use zbus::zvariant::Type;
     use zbus::ProxyDefault; // Trait // Trait?
     /// Get a list of all Bluetooth devices which have been discovered so far.
-    async fn find_devices(
+    async fn find_devices<'device>(
         connection: &zbus::Connection,
-    ) -> zbus::Result<Vec<(OwnedObjectPath, Device1Proxy, Properties)>> {
+    ) -> zbus::Result<HashMap<OwnedObjectPath, Device1Proxy<'device>>> {
         let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
             .destination("org.bluez")?
             .path("/")?
@@ -389,7 +390,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .collect();
 
         // Return the mappings of proxy types + properties in case someone cares.
-        let mut result: Vec<(OwnedObjectPath, Device1Proxy, Properties)> = Vec::new();
+        let mut result: Vec<(OwnedObjectPath, Device1Proxy)> = Vec::new();
         for (object_path, blob) in devices {
             let device = Device1Proxy::builder(&connection)
                 .destination("org.bluez")?
@@ -415,10 +416,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("rssi={:?}", rssi);
                         };
             */
-
-            result.push((object_path, device, blob));
+            result.push((object_path, device));
         }
-        Ok(result)
+        let out = HashMap::from_iter(result);
+        Ok(out)
     }
 
     let mut adapters = find_adapters(&connection).await?;
@@ -436,12 +437,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let addr = adapter.address().await?;
     println!("We have a hci address: {}", addr);
 
-    let _devices = find_devices(&connection).await?;
-    use tokio_stream::StreamMap;
-    //    let mut prop_stream = StreamMap::new();
-    let mut sig_stream = StreamMap::new();
+    let mut devices = find_devices(&connection).await?;
 
-    for (opath, dev, _) in &_devices {
+    for (opath, dev) in &devices {
         //        let stream = dev.receive_all_signals().await?;
         let path = dev.path().to_owned();
         let dest = dev.destination().to_owned();
@@ -465,8 +463,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         //        prop_stream.insert(key, stream);
     }
 
+    let (task_write, mut task_read) = mpsc::channel(100);
     println!("Meeeh, no stream");
-    for (opath, dev, _) in &_devices {
+    for (opath, dev) in &devices {
         let path = dev.path().to_owned();
         let dest = dev.destination().to_owned();
         let iface = dev.interface().to_owned();
@@ -482,7 +481,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let stream = dev.receive_manufacturer_data_changed().await;
         let key = dev.path().to_owned();
         //dbg!(&stream);
-        sig_stream.insert(key, stream);
+        task_write
+            .send(tokio::spawn(manufacturer_listener(stream)))
+            .await
+            .unwrap();
     }
     println!("meeh about to manage some proies");
 
@@ -496,96 +498,146 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut removed = bluez_root.receive_interfaces_removed().await?;
     //   let mut allsig = dbus_proxy.receive_all_signals().await?;
 
-    tokio::join!(
-        async {
-            while let Some(v) = added.next().await {
-                if let Ok(data) = v.args() {
-                    //println!("Interfaces Added: data={:?}",  &data);
-                    let object_path = data.object_path;
+    let pmap = Arc::new(Mutex::new(devices));
 
-                    // Filter down to only the pairs that match our interface
-                    let devdata = data
-                        .interfaces_and_properties
-                        .into_iter()
-                        .filter_map(|(interface, data)| match interface {
-                            Device1Proxy::INTERFACE => Some(data),
-                            _ => None,
-                        })
-                        .next();
-                    if let Some(data) = devdata {
-                        println!("Would create thingie here {:?}", data);
-                        // Do something here with Data["ManufacturerData"]  to parse it into
-                        // something useful
-                        let device = Device1Proxy::builder(&connection)
-                            .destination("org.bluez")
-                            .unwrap()
-                            .path(object_path)
-                            .unwrap()
-                            .cache_properties(zbus::CacheProperties::Yes)
-                            .build()
-                            .await
-                            .unwrap();
-                    };
+    async fn singals_drop_device(
+        mut removed: zbus::fdo::InterfacesRemovedStream<'_>,
+        pmap: Arc<Mutex<HashMap<OwnedObjectPath, Device1Proxy<'_>>>>,
+    ) {
+        let pmap = pmap.clone();
+        while let Some(v) = removed.next().await {
+            // println!("Something happened: {:?}", v);
+            if let Ok(data) = v.args() {
+                println!("Interfaces Removed: data={:?}", &data);
+                let path = data.object_path;
+                let hashpath = OwnedObjectPath::from(path.as_ref());
+                let mut devices = pmap.lock().unwrap();
 
-                    //                    Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
-                }
-                // println!("Something happened: {:?}", v);
-                //           println!("Added: {:?}", &v);
-                //                println!("Added: {:?}", v.args().unwrap());
-            }
-        },
-        async {
-            while let Some(v) = removed.next().await {
-                // println!("Something happened: {:?}", v);
-                if let Ok(data) = v.args() {
-                    println!("Interfaces Removed: data={:?}", &data);
-                    let path = data.object_path;
-                    for (opath, dev, _) in &_devices {
-                        if &opath.as_ref() == &path {
-                            if data.interfaces.contains(&dev.interface().as_str()) {
-                                println!("Should remove this dev {:?}", dev);
-                                /*  We can only read cached values here, thus it should be dropped.
-                                 *  Or maybe not dropped, we can just keep it around? Though we will get more subscriptions over
-                                 *  time
-                                 *                              let res = dev.modalias().await;
-                                                                match res {
-                                                                    Ok(manuf_data) => println!("manuf_data={:?}", manuf_data),
-                                                                    Err(something)  => println!("error {}",something),
-                                                                }
-                                */
-                            }
-                        }
-                    }
-                }
-                //              println!("Removed: {:?}", v.args().unwrap());
-            }
-        },
-        //        async {
-        //            while let Some((k, v)) = prop_stream.next().await {
-        //                let args = v.args().unwrap();
-        //                for (name, value) in args.changed_properties().iter() {
-        //                    println!("PropertyChanged: k={} {:?} to {:?}", &k, &name, &value);
-        //                }
-
-        //                let payload = v.get().await.unwrap();
-        //                println!("prop_stream: {:?} payload {:?}", v.name(), payload);
-        //            }
-        //        },
-        async {
-            while let Some((k, v)) = sig_stream.next().await {
-                // println!("Something happened: {:?}", v);
-                // println!("Signal: {:?} payload {:?}", v.name(), payload);
-                // println!("device Signal: k={} {:?} name={}", &k, &val, v.name());
-                if v.name() == "ManufacturerData" {
-                    if let Ok(val) = v.get().await {
-                        if let Some(sens) = from_manuf(val) {
-                            println!("Ruuvi data {:?}", sens);
+                if let Some(dev) = devices.get(&hashpath) {
+                    // Only drop the device _if_ the interface we use is amongst the dropped.
+                    if data.interfaces.contains(&dev.interface().as_str()) {
+                        if let Some(dev) = devices.remove(&hashpath) {
+                            println!("Removed this dev {:?}", dev.path().as_str());
+                            //println!("Removed this dev {:?}", dev);
+                        } else {
+                            println!("Failed to remove"); // {:?}", dev);
                         }
                     }
                 }
             }
+        }
+    }
+
+    async fn signals_add_device(
+        mut added: zbus::fdo::InterfacesAddedStream<'_>,
+        pmap: Arc<Mutex<HashMap<OwnedObjectPath, Device1Proxy<'_>>>>,
+        connection: zbus::Connection,
+        mut task_write: mpsc::Sender<tokio::task::JoinHandle<()>>,
+    ) {
+        //                    Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
+
+        let pmap = pmap.clone();
+        while let Some(v) = added.next().await {
+            if let Ok(data) = v.args() {
+                //println!("Interfaces Added: data={:?}",  &data);
+                let object_path = data.object_path.clone();
+                let hashpath = OwnedObjectPath::from(object_path.as_ref()).clone();
+                let hashpath2 = OwnedObjectPath::from(object_path.as_ref()).clone();
+                let hashpath3 = OwnedObjectPath::from(object_path.as_ref()).clone();
+
+                // Filter down to only the pairs that match our interface
+                let devdata = data
+                    .interfaces_and_properties
+                    .into_iter()
+                    .filter_map(|(interface, data)| match interface {
+                        Device1Proxy::INTERFACE => Some(data),
+                        _ => None,
+                    })
+                    .next();
+                if devdata.is_some() {
+                    // Do something here with Data["ManufacturerData"]  to parse it into
+                    // something useful
+                    let device = Device1Proxy::builder(&connection)
+                        .destination("org.bluez")
+                        .unwrap()
+                        .path(hashpath2)
+                        .unwrap()
+                        .cache_properties(zbus::CacheProperties::Yes)
+                        .build()
+                        .await
+                        .unwrap();
+
+                    println!("Setting up receive manufacturer_data_changed signal, device={:?}, dest={:?}, iface={:?} name={:?} addr={:?}",
+                        device.path(), device.destination(), device.interface(), device.name().await.ok(), device.address().await.ok(),
+                    );
+                    let stream = device.receive_manufacturer_data_changed().await;
+                    // Spawn a task and drop it on the floor.
+                    // Maybe we should hand it off to something else later on
+                    task_write
+                        .send(tokio::spawn(manufacturer_listener(stream)))
+                        .await
+                        .unwrap();
+                    let mut devices = pmap.lock().unwrap();
+                    if let Some(old) = devices.insert(hashpath, device) {
+                        println!("There was alrady a device in there! {:?}", old);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn manufacturer_listener(mut stream: zbus::PropertyStream<'_, HashMap<u16, Vec<u8>>>) {
+        while let Some(v) = stream.next().await {
+            //           println!("Something happened: {:?}", v.name());
+            // println!("Signal: {:?} payload {:?}", v.name(), payload);
+            println!("device Signal: name={}, val={:?}", v.name(), v.get().await);
+            if v.name() == "ManufacturerData" {
+                if let Ok(val) = v.get().await {
+                    if let Some(sens) = from_manuf(val) {
+                        println!("Ruuvi data {:?}", sens);
+                    }
+                }
+            }
+        }
+    }
+    let taskinger = task_write.clone();
+    tokio::try_join!(
+        async move {
+            let mut tasks = Vec::new();
+            println!("Awaiting tasks");
+            while let Some(t) = task_read.recv().await {
+                tasks.push(t);
+                let sum: usize = tasks
+                    .iter()
+                    .map(|t| match t.is_finished() {
+                        true => 1,
+                        false => 0,
+                    })
+                    .sum();
+                println!("New task arrived, tasks={} finished={}", tasks.len(), sum);
+            }
+            Ok(())
         },
-    );
+        tokio::spawn(singals_drop_device(removed, pmap.clone())),
+        tokio::spawn(signals_add_device(
+            added,
+            pmap.clone(),
+            connection.clone(),
+            task_write.clone()
+        )),
+    )
+    .expect("Tried to fail");
+    //        async {
+    //            while let Some((k, v)) = prop_stream.next().await {
+    //                let args = v.args().unwrap();
+    //                for (name, value) in args.changed_properties().iter() {
+    //                    println!("PropertyChanged: k={} {:?} to {:?}", &k, &name, &value);
+    //                }
+
+    //                let payload = v.get().await.unwrap();
+    //                println!("prop_stream: {:?} payload {:?}", v.name(), payload);
+    //            }
+    //        },
 
     // All done, shut down
     adapter.stop_discovery().await?;
