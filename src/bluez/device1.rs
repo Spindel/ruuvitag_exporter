@@ -21,8 +21,6 @@
 #![allow(non_snake_case)]
 use zbus::dbus_proxy;
 
-use zbus::zvariant::Type;
-
 #[dbus_proxy(interface = "org.bluez.Device1")]
 trait Device1 {
     /// CancelPairing method

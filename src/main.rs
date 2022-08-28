@@ -327,16 +327,20 @@ async fn ruuvi_emitter(
 use zbus::Connection;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    use std::convert::From;
+    use std::error::Error;
+    use std::sync::{Arc, Mutex};
+    use zbus::zvariant::OwnedObjectPath;
+    use zbus::ProxyDefault; // Trait
     tracing_subscriber::fmt::init();
 
     let mut connection = Connection::system().await?;
     connection.set_max_queued(25600);
 
     async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
-        use zbus::ProxyDefault;
         let mut result: Vec<Adapter1Proxy> = Vec::new();
 
-        let p = zbus::fdo::ObjectManagerProxy::builder(&connection)
+        let p = zbus::fdo::ObjectManagerProxy::builder(connection)
             .destination("org.bluez")?
             .path("/")?
             .build()
@@ -344,11 +348,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let managed = p.get_managed_objects().await?;
 
         for (path, children) in &managed {
-            for (interface, _props) in children {
+            for interface in children.keys() {
+                // for interface, _props in children {
                 // This will print the found paths, devices and their metadata
                 // println!("path={:?} interface={} muh={:?}", &path, interface, _props);
                 if interface.as_str() == Adapter1Proxy::INTERFACE {
-                    let adapter = Adapter1Proxy::builder(&connection)
+                    let adapter = Adapter1Proxy::builder(connection)
                         .destination("org.bluez")?
                         .path(path.clone())?
                         .build()
@@ -359,19 +364,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Ok(result)
     }
-    use std::convert::From;
-    use std::sync::{Arc, Mutex};
-    use zbus::zvariant::OwnedValue;
-    type Properties = HashMap<String, OwnedValue>;
-    use zbus::fdo::PropertiesProxy;
-    use zbus::zvariant::OwnedObjectPath;
-    use zbus::zvariant::Type;
-    use zbus::ProxyDefault; // Trait // Trait?
+
     /// Get a list of all Bluetooth devices which have been discovered so far.
     async fn find_devices<'device>(
         connection: &zbus::Connection,
-    ) -> zbus::Result<HashMap<OwnedObjectPath, Device1Proxy<'device>>> {
-        let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
+    ) -> zbus::Result<Vec<OwnedObjectPath>> {
+        let bluez_root = zbus::fdo::ObjectManagerProxy::builder(connection)
             .destination("org.bluez")?
             .path("/")?
             .build()
@@ -379,49 +377,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let tree = bluez_root.get_managed_objects().await?;
 
         // Filter down to only the pairs that match our interface
-        let devices: Vec<(OwnedObjectPath, Properties)> = tree
+        let result = tree
             .into_iter()
             .filter_map(|(object_path, mut children)| {
-                match children.remove(Device1Proxy::INTERFACE) {
-                    Some(data) => Some((object_path, data)),
-                    None => None,
-                }
+                children
+                    .remove(Device1Proxy::INTERFACE)
+                    .map(|data| (object_path, data))
             })
+            .map(|(object_path, _)| object_path)
             .collect();
-
-        // Return the mappings of proxy types + properties in case someone cares.
-        let mut result: Vec<(OwnedObjectPath, Device1Proxy)> = Vec::new();
-        for (object_path, blob) in devices {
-            let device = Device1Proxy::builder(&connection)
-                .destination("org.bluez")?
-                .path(object_path.clone())?
-                .cache_properties(zbus::CacheProperties::Yes)
-                .build()
-                .await?;
-
-            println!(
-                "dev adapter= {:?}  addr={}",
-                device.adapter().await?,
-                device.address().await?
-            );
-            if let Ok(manuf_data) = device.manufacturer_data().await {
-                //println!("manuf_data conversion: {:?}", &manuf_data);
-                if let Some(sens) = from_manuf(manuf_data) {
-                    println!("Ruuvi data {:?}", sens);
-                }
-            };
-            /*
-             * Example of how to call the get_property and type-convert it without having a direct proxy
-                        if let Ok(rssi) = device.get_property::<i16>("RSSI").await {
-                            println!("rssi={:?}", rssi);
-                        };
-            */
-            result.push((object_path, device));
-        }
-        let out = HashMap::from_iter(result);
-        Ok(out)
+        Ok(result)
     }
 
+    let (task_write, mut task_read) = mpsc::channel(100);
     let mut adapters = find_adapters(&connection).await?;
     let adapter = adapters.pop().unwrap();
     adapter.set_powered(true).await?;
@@ -436,57 +404,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let addr = adapter.address().await?;
     println!("We have a hci address: {}", addr);
+    let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, Device1Proxy>::new()));
 
-    let mut devices = find_devices(&connection).await?;
-
-    for (opath, dev) in &devices {
-        //        let stream = dev.receive_all_signals().await?;
-        let path = dev.path().to_owned();
-        let dest = dev.destination().to_owned();
-        println!("{}, {}", &path, &dest);
-        /*
-        let props = zbus::fdo::PropertiesProxy::builder(&connection)
-            .destination("org.bluez")?
-            .cache_properties(zbus::CacheProperties::Yes)
-            .path(path)?
-            .build()
-            .await?;
-        println!("device={:?}, {:?}", props.path(), props.interface());
-        for (k, v) in props.get_all(dev.interface().to_owned()).await? {
-            println!("Property {:?} == {:?}", k, v);
-        }*/
-        //
-        //let mut stream = props.receive_properties_changed().await?;
-        //        println!("Meeeh got stream");
-        //        let stream = dev.receive_rssi_changed().await;
-        //        let key = dev.path().to_owned();
-        //        prop_stream.insert(key, stream);
+    for object_path in find_devices(&connection).await? {
+        make_new_device(&connection, object_path, &task_write, &pmap).await?;
     }
 
-    let (task_write, mut task_read) = mpsc::channel(100);
-    println!("Meeeh, no stream");
-    for (opath, dev) in &devices {
-        let path = dev.path().to_owned();
-        let dest = dev.destination().to_owned();
-        let iface = dev.interface().to_owned();
-
-        let devaddr = dev.address().await?;
-        let devname = dev.name().await.ok();
-        println!(
-            "Setting up receive manufacturer_data_changed signal, device={:?}, dest={:?}, iface={:?} name={:?} addr={:?}",
-            path, dest, iface, devname, devaddr
-        );
-        //let stream = dev.receive_all_signals().await?;
-        //        let stream = dev.receive_rssi_changed().await;
-        let stream = dev.receive_manufacturer_data_changed().await;
-        let key = dev.path().to_owned();
-        //dbg!(&stream);
-        task_write
-            .send(tokio::spawn(manufacturer_listener(stream)))
-            .await
-            .unwrap();
-    }
-    println!("meeh about to manage some proies");
+    println!("meeh about to manage some proxies for the interface events");
 
     // Lets try to get some changes on the devices
     let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
@@ -494,17 +418,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .path("/")?
         .build()
         .await?;
-    let mut added = bluez_root.receive_interfaces_added().await?;
-    let mut removed = bluez_root.receive_interfaces_removed().await?;
+    let added = bluez_root.receive_interfaces_added().await?;
+    let removed = bluez_root.receive_interfaces_removed().await?;
     //   let mut allsig = dbus_proxy.receive_all_signals().await?;
-
-    let pmap = Arc::new(Mutex::new(devices));
 
     async fn singals_drop_device(
         mut removed: zbus::fdo::InterfacesRemovedStream<'_>,
-        pmap: Arc<Mutex<HashMap<OwnedObjectPath, Device1Proxy<'_>>>>,
+        pmap: DeviceHash<'_>,
     ) {
-        let pmap = pmap.clone();
         while let Some(v) = removed.next().await {
             // println!("Something happened: {:?}", v);
             if let Ok(data) = v.args() {
@@ -528,59 +449,70 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, Device1Proxy<'device>>>>;
+    type TaskChannel = mpsc::Sender<tokio::task::JoinHandle<()>>;
+
+    async fn make_new_device(
+        connection: &zbus::Connection,
+        object_path: OwnedObjectPath,
+        task_write: &TaskChannel,
+        pmap: &DeviceHash<'_>,
+    ) -> Result<(), Box<dyn Error>> {
+        let device = Device1Proxy::builder(connection)
+            .destination("org.bluez")?
+            .path(object_path.clone())?
+            .cache_properties(zbus::CacheProperties::Yes)
+            .build()
+            .await?;
+
+        println!("Setting up receive manufacturer_data_changed signal, device={:?}, dest={:?}, iface={:?} name={:?} addr={:?}", device.path(), device.destination(), device.interface(), device.name().await.ok(), device.address().await.ok());
+
+        if let Ok(manuf_data) = device.manufacturer_data().await {
+            //println!("manuf_data conversion: {:?}", &manuf_data);
+            if let Some(sens) = from_manuf(manuf_data) {
+                println!("Ruuvi data {:?}", sens);
+            }
+        };
+
+        let stream = device.receive_manufacturer_data_changed().await;
+        // Spawn a task and drop it on the floor.
+        // Maybe we should hand it off to something else later on
+        task_write
+            .send(tokio::spawn(manufacturer_listener(stream)))
+            .await?;
+        let mut devices = pmap.lock().unwrap();
+        if let Some(old) = devices.insert(object_path, device) {
+            println!("There was alrady a device in there! {:?}", old);
+        }
+        Ok(())
+    }
+
     async fn signals_add_device(
         mut added: zbus::fdo::InterfacesAddedStream<'_>,
-        pmap: Arc<Mutex<HashMap<OwnedObjectPath, Device1Proxy<'_>>>>,
+        pmap: DeviceHash<'_>,
         connection: zbus::Connection,
-        mut task_write: mpsc::Sender<tokio::task::JoinHandle<()>>,
+        task_write: TaskChannel,
     ) {
         //                    Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
 
-        let pmap = pmap.clone();
         while let Some(v) = added.next().await {
             if let Ok(data) = v.args() {
                 //println!("Interfaces Added: data={:?}",  &data);
                 let object_path = data.object_path.clone();
                 let hashpath = OwnedObjectPath::from(object_path.as_ref()).clone();
-                let hashpath2 = OwnedObjectPath::from(object_path.as_ref()).clone();
-                let hashpath3 = OwnedObjectPath::from(object_path.as_ref()).clone();
 
                 // Filter down to only the pairs that match our interface
-                let devdata = data
-                    .interfaces_and_properties
-                    .into_iter()
-                    .filter_map(|(interface, data)| match interface {
-                        Device1Proxy::INTERFACE => Some(data),
-                        _ => None,
-                    })
-                    .next();
+                let devdata =
+                    data.interfaces_and_properties
+                        .into_iter()
+                        .find_map(|(interface, data)| match interface {
+                            Device1Proxy::INTERFACE => Some(data),
+                            _ => None,
+                        });
                 if devdata.is_some() {
-                    // Do something here with Data["ManufacturerData"]  to parse it into
-                    // something useful
-                    let device = Device1Proxy::builder(&connection)
-                        .destination("org.bluez")
-                        .unwrap()
-                        .path(hashpath2)
-                        .unwrap()
-                        .cache_properties(zbus::CacheProperties::Yes)
-                        .build()
+                    make_new_device(&connection, hashpath, &task_write, &pmap)
                         .await
                         .unwrap();
-
-                    println!("Setting up receive manufacturer_data_changed signal, device={:?}, dest={:?}, iface={:?} name={:?} addr={:?}",
-                        device.path(), device.destination(), device.interface(), device.name().await.ok(), device.address().await.ok(),
-                    );
-                    let stream = device.receive_manufacturer_data_changed().await;
-                    // Spawn a task and drop it on the floor.
-                    // Maybe we should hand it off to something else later on
-                    task_write
-                        .send(tokio::spawn(manufacturer_listener(stream)))
-                        .await
-                        .unwrap();
-                    let mut devices = pmap.lock().unwrap();
-                    if let Some(old) = devices.insert(hashpath, device) {
-                        println!("There was alrady a device in there! {:?}", old);
-                    }
                 }
             }
         }
@@ -600,21 +532,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    let taskinger = task_write.clone();
     tokio::try_join!(
         async move {
             let mut tasks = Vec::new();
             println!("Awaiting tasks");
             while let Some(t) = task_read.recv().await {
                 tasks.push(t);
-                let sum: usize = tasks
-                    .iter()
-                    .map(|t| match t.is_finished() {
-                        true => 1,
-                        false => 0,
-                    })
-                    .sum();
-                println!("New task arrived, tasks={} finished={}", tasks.len(), sum);
+                let finished: usize = tasks.iter().map(|t| usize::from(t.is_finished())).sum();
+                println!(
+                    "New task arrived, tasks={} finished={}",
+                    tasks.len(),
+                    finished
+                );
             }
             Ok(())
         },
