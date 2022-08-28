@@ -575,11 +575,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         async {
             while let Some((k, v)) = sig_stream.next().await {
                 // println!("Something happened: {:?}", v);
-                //println!("Signal: {:?} payload {:?}", v.name(), payload);
-                if let Ok(val) = v.get().await {
-                    println!("device Signal: k={} {:?}", &k, &val);
-                    if let Some(sens) = from_manuf(val) {
-                        println!("Ruuvi data {:?}", sens);
+                // println!("Signal: {:?} payload {:?}", v.name(), payload);
+                // println!("device Signal: k={} {:?} name={}", &k, &val, v.name());
+                if v.name() == "ManufacturerData" {
+                    if let Ok(val) = v.get().await {
+                        if let Some(sens) = from_manuf(val) {
+                            println!("Ruuvi data {:?}", sens);
+                        }
                     }
                 }
             }
