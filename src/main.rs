@@ -390,20 +390,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let (task_write, mut task_read) = mpsc::channel(100);
-    let mut adapters = find_adapters(&connection).await?;
-    let adapter = adapters.pop().unwrap();
-    adapter.set_powered(true).await?;
-    // discovery filter is a map str=>val with fixed keys
-    // see
-    //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
-    // and
-    //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
-    //
-    adapter.set_discovery_filter(HashMap::new()).await?;
-    adapter.start_discovery().await?;
-
-    let addr = adapter.address().await?;
-    println!("We have a hci address: {}", addr);
+    let adapters = find_adapters(&connection).await?;
+    for adapter in &adapters {
+        adapter.set_powered(true).await?;
+        // discovery filter is a map str=>val with fixed keys
+        // see
+        //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
+        // and
+        //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
+        //
+        adapter.set_discovery_filter(HashMap::new()).await?;
+        adapter.start_discovery().await?;
+        println!(
+            "adapter  hci address: {}, scanning.",
+            adapter.address().await?
+        );
+    }
     let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, Device1Proxy>::new()));
 
     for object_path in find_devices(&connection).await? {
@@ -569,7 +571,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //        },
 
     // All done, shut down
-    adapter.stop_discovery().await?;
+    for adapter in &adapters {
+        adapter.stop_discovery().await?;
+    }
 
     let manager = Manager::new().await?;
 
