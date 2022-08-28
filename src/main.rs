@@ -3,8 +3,6 @@ use std::error::Error;
 use std::net::SocketAddr;
 
 mod bluez;
-use bluez::adapter1::Adapter1Proxy;
-use bluez::device1::Device1Proxy;
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral};
 use btleplug::platform::{Adapter, Manager};
@@ -324,20 +322,22 @@ async fn ruuvi_emitter(
         central.stop_scan().await?;
     }
 }
-use zbus::Connection;
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+
+mod mybus {
+    use crate::bluez::adapter1::Adapter1Proxy;
+    pub use crate::bluez::device1::Device1Proxy;
+    use crate::from_manuf;
+    use std::collections::HashMap;
     use std::convert::From;
     use std::error::Error;
     use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
-    tracing_subscriber::fmt::init();
+    type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, Device1Proxy<'device>>>>;
+    type TaskChannel = mpsc::Sender<tokio::task::JoinHandle<()>>;
 
-    let mut connection = Connection::system().await?;
-    connection.set_max_queued(25600);
-
-    async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
+    pub async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
         let mut result: Vec<Adapter1Proxy> = Vec::new();
 
         let p = zbus::fdo::ObjectManagerProxy::builder(connection)
@@ -366,7 +366,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     /// Get a list of all Bluetooth devices which have been discovered so far.
-    async fn find_devices<'device>(
+    pub async fn find_devices<'device>(
         connection: &zbus::Connection,
     ) -> zbus::Result<Vec<OwnedObjectPath>> {
         let bluez_root = zbus::fdo::ObjectManagerProxy::builder(connection)
@@ -389,45 +389,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(result)
     }
 
-    let (task_write, mut task_read) = mpsc::channel(100);
-    let adapters = find_adapters(&connection).await?;
-    for adapter in &adapters {
-        adapter.set_powered(true).await?;
-        // discovery filter is a map str=>val with fixed keys
-        // see
-        //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
-        // and
-        //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
-        //
-        adapter.set_discovery_filter(HashMap::new()).await?;
-        adapter.start_discovery().await?;
-        println!(
-            "adapter  hci address: {}, scanning.",
-            adapter.address().await?
-        );
-    }
-    let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, Device1Proxy>::new()));
-
-    for object_path in find_devices(&connection).await? {
-        make_new_device(&connection, object_path, &task_write, &pmap).await?;
-    }
-
-    println!("meeh about to manage some proxies for the interface events");
-
-    // Lets try to get some changes on the devices
-    let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
-        .destination("org.bluez")?
-        .path("/")?
-        .build()
-        .await?;
-    let added = bluez_root.receive_interfaces_added().await?;
-    let removed = bluez_root.receive_interfaces_removed().await?;
-    //   let mut allsig = dbus_proxy.receive_all_signals().await?;
-
-    async fn singals_drop_device(
+    pub async fn singals_drop_device(
         mut removed: zbus::fdo::InterfacesRemovedStream<'_>,
         pmap: DeviceHash<'_>,
     ) {
+        use tokio_stream::StreamExt;
         while let Some(v) = removed.next().await {
             // println!("Something happened: {:?}", v);
             if let Ok(data) = v.args() {
@@ -451,10 +417,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, Device1Proxy<'device>>>>;
-    type TaskChannel = mpsc::Sender<tokio::task::JoinHandle<()>>;
-
-    async fn make_new_device(
+    pub async fn make_new_device(
         connection: &zbus::Connection,
         object_path: OwnedObjectPath,
         task_write: &TaskChannel,
@@ -489,12 +452,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(())
     }
 
-    async fn signals_add_device(
+    pub async fn signals_add_device(
         mut added: zbus::fdo::InterfacesAddedStream<'_>,
         pmap: DeviceHash<'_>,
         connection: zbus::Connection,
         task_write: TaskChannel,
     ) {
+        use tokio_stream::StreamExt;
         //                    Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
 
         while let Some(v) = added.next().await {
@@ -520,7 +484,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    async fn manufacturer_listener(mut stream: zbus::PropertyStream<'_, HashMap<u16, Vec<u8>>>) {
+    pub async fn manufacturer_listener(
+        mut stream: zbus::PropertyStream<'_, HashMap<u16, Vec<u8>>>,
+    ) {
+        use tokio_stream::StreamExt;
         while let Some(v) = stream.next().await {
             //           println!("Something happened: {:?}", v.name());
             // println!("Signal: {:?} payload {:?}", v.name(), payload);
@@ -534,18 +501,80 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    use mybus::find_adapters;
+    use mybus::find_devices;
+    use mybus::make_new_device;
+    use mybus::signals_add_device;
+    use mybus::singals_drop_device;
+    use mybus::Device1Proxy;
+    use std::convert::From;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+    use zbus::zvariant::OwnedObjectPath;
+    use zbus::Connection;
+
+    tracing_subscriber::fmt::init();
+    let mut connection = Connection::system().await?;
+    connection.set_max_queued(25600);
+
+    // Mapping of  the device path => device
+    // Used so we can remove device proxies that are out of date.
+    let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, Device1Proxy>::new()));
+
+    let (task_write, mut task_read) = mpsc::channel(100);
+
+    let adapters = find_adapters(&connection).await?;
+    for adapter in &adapters {
+        adapter.set_powered(true).await?;
+        // discovery filter is a map str=>val with fixed keys
+        // see
+        //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
+        // and
+        //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
+        //
+        adapter.set_discovery_filter(HashMap::new()).await?;
+        adapter.start_discovery().await?;
+        println!(
+            "adapter  hci address: {}, scanning.",
+            adapter.address().await?
+        );
+    }
+
+    for object_path in find_devices(&connection).await? {
+        make_new_device(&connection, object_path, &task_write, &pmap).await?;
+    }
+
+    println!("meeh about to manage some proxies for the interface events");
+
+    // Lets try to get some changes on the devices
+    let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
+        .destination("org.bluez")?
+        .path("/")?
+        .build()
+        .await?;
+    let added = bluez_root.receive_interfaces_added().await?;
+    let removed = bluez_root.receive_interfaces_removed().await?;
+    //   let mut allsig = dbus_proxy.receive_all_signals().await?;
+
     tokio::try_join!(
         async move {
-            let mut tasks = Vec::new();
+            // let mut tasks = Vec::new();
             println!("Awaiting tasks");
             while let Some(t) = task_read.recv().await {
+                println!("Awaiting t={:?}", t);
+                t.await;
+                /*
                 tasks.push(t);
                 let finished: usize = tasks.iter().map(|t| usize::from(t.is_finished())).sum();
                 println!(
                     "New task arrived, tasks={} finished={}",
                     tasks.len(),
                     finished
-                );
+                );*/
             }
             Ok(())
         },
