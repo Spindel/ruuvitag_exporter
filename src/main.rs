@@ -421,7 +421,9 @@ mod mybus {
         object_path: OwnedObjectPath,
         pmap: &DeviceHash<'_>,
         tx: tokio::sync::mpsc::Sender<SensorValues>,
+        task_write: &tokio::sync::mpsc::Sender<tokio::task::JoinHandle<()>>,
     ) -> Result<(), Box<dyn Error>> {
+        use futures_lite::future::FutureExt;
         let device = Device1Proxy::builder(connection)
             .destination("org.bluez")?
             .path(object_path.clone())?
@@ -433,7 +435,11 @@ mod mybus {
 
         let stream = device.receive_manufacturer_data_changed().await;
         // Spawn a task to poll this device's stream
-        tokio::spawn(manufacturer_listener(stream, tx));
+        let tsk = tokio::spawn(manufacturer_listener(stream, tx));
+        {
+            println!("Spawning task to listen");
+            task_write.send(tsk).await.unwrap();
+        }
         /*
         if let Ok(manuf_data) = device.manufacturer_data().await {
             //println!("manuf_data conversion: {:?}", &manuf_data);
@@ -454,6 +460,7 @@ mod mybus {
         pmap: DeviceHash<'_>,
         connection: zbus::Connection,
         tx: tokio::sync::mpsc::Sender<SensorValues>,
+        task_write: tokio::sync::mpsc::Sender<tokio::task::JoinHandle<()>>,
     ) {
         use tokio_stream::StreamExt;
         //                    Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
@@ -473,7 +480,7 @@ mod mybus {
                             _ => None,
                         });
                 if devdata.is_some() {
-                    make_new_device(&connection, hashpath, &pmap, tx.clone())
+                    make_new_device(&connection, hashpath, &pmap, tx.clone(), &task_write)
                         .await
                         .unwrap();
                 }
@@ -541,8 +548,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let (tx, rx) = mpsc::channel(100);
+    let (task_tx, mut task_rx) = mpsc::channel(100);
     for object_path in find_devices(&connection).await? {
-        make_new_device(&connection, object_path, &pmap, tx.clone()).await?;
+        make_new_device(&connection, object_path, &pmap, tx.clone(), &task_tx).await?;
     }
 
     println!("meeh about to manage some proxies for the interface events");
@@ -563,10 +571,66 @@ async fn main() -> Result<(), Box<dyn Error>> {
             added,
             pmap.clone(),
             connection.clone(),
-            tx.clone()
+            tx.clone(),
+            task_tx.clone()
         )),
+        async {
+            let mut waiting_tasks = futures::stream::FuturesUnordered::new();
+            loop {
+                let before = std::time::Instant::now();
+                let demo = task_rx.recv().await;
+                if let Some(task) = demo {
+                    println!(
+                        "Waited {}.{} for a task",
+                        before.elapsed().as_secs(),
+                        before.elapsed().subsec_millis()
+                    );
+                    println!("Pending task t={:?}", task);
+                    waiting_tasks.push(task);
+                }
+                /*
+                if let Some(task) = task_rx.recv().await {
+                    println!("Pending task t={:?}", task);
+                    waiting_tasks.push(task);
+                }*/
+                let delay = std::time::Duration::from_millis(10);
+                if let Ok(maybe_task) = tokio::time::timeout(delay, waiting_tasks.next()).await {
+                    if let Some(task) = maybe_task {
+                        println!("Got task data: {:?}", task);
+                        let res = task.unwrap();
+                        println!("Task res {:?}", res);
+                    }
+                    /* Else:  Stream is cloed */
+                } /*
+                  if let Some(task) = waiting_tasks.next().await {
+                      println!("Task complete {:?}", task);
+                      dbg!(task);
+                      //       let () = t.unwrap();
+                      //let res = task.unwrap();
+                      //dbg!(res);
+                  }*/
+            }
+            Ok(())
+        },
+        /*
+            tokio::join!(
+                async {
+
+                },
+                async {
+                    while let Some(task) = waiting_tasks.next().await {
+                        println!("Task complete {:?}", task);
+                         //       let () = t.unwrap();
+                         let res = task.unwrap();
+                         dbg!(res);
+                    }
+                },
+            );
+        }*/
     )
     .expect("Tried to fail");
+
+    //println!("First res t={:?}", res);
     //        async {
     //            while let Some((k, v)) = prop_stream.next().await {
     //                let args = v.args().unwrap();

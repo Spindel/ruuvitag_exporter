@@ -16,3 +16,5 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"]}
 tracing = "0.1"
 tracing-subscriber = "0.3"
 zbus = { version = "2", default-features = false, features = ["tokio"] }
+futures-lite = "*"
+futures = "*"
