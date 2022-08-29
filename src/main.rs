@@ -567,66 +567,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tokio::try_join!(
         tokio::spawn(singals_drop_device(removed, pmap.clone())),
-        tokio::spawn(signals_add_device(
-            added,
-            pmap.clone(),
-            connection.clone(),
-            tx.clone(),
-            task_tx.clone()
-        )),
+        tokio::spawn(signals_add_device(added, pmap.clone(), connection.clone(), tx.clone(), task_tx.clone())),
         async {
-            let mut waiting_tasks = futures::stream::FuturesUnordered::new();
+            let mut waiting_tasks  = futures::stream::FuturesUnordered::new();
             loop {
-                let before = std::time::Instant::now();
-                let demo = task_rx.recv().await;
-                if let Some(task) = demo {
-                    println!(
-                        "Waited {}.{} for a task",
-                        before.elapsed().as_secs(),
-                        before.elapsed().subsec_millis()
-                    );
-                    println!("Pending task t={:?}", task);
-                    waiting_tasks.push(task);
+                /*println!("We have {} tasks", waiting_tasks.len());*/
+                tokio::select!{
+                    task = task_rx.recv() => { /*println!("Got task {:?}", task);*/  waiting_tasks.push(task.unwrap()); },
+                    done = waiting_tasks.next() => { println!("Done task {:?}", done); },
+                    else => break,
                 }
-                /*
-                if let Some(task) = task_rx.recv().await {
-                    println!("Pending task t={:?}", task);
-                    waiting_tasks.push(task);
-                }*/
-                let delay = std::time::Duration::from_millis(10);
-                if let Ok(maybe_task) = tokio::time::timeout(delay, waiting_tasks.next()).await {
-                    if let Some(task) = maybe_task {
-                        println!("Got task data: {:?}", task);
-                        let res = task.unwrap();
-                        println!("Task res {:?}", res);
-                    }
-                    /* Else:  Stream is cloed */
-                } /*
-                  if let Some(task) = waiting_tasks.next().await {
-                      println!("Task complete {:?}", task);
-                      dbg!(task);
-                      //       let () = t.unwrap();
-                      //let res = task.unwrap();
-                      //dbg!(res);
-                  }*/
             }
+            println!("No more mr loop guy");
             Ok(())
         },
-        /*
-            tokio::join!(
-                async {
-
-                },
-                async {
-                    while let Some(task) = waiting_tasks.next().await {
-                        println!("Task complete {:?}", task);
-                         //       let () = t.unwrap();
-                         let res = task.unwrap();
-                         dbg!(res);
-                    }
-                },
-            );
-        }*/
     )
     .expect("Tried to fail");
 
