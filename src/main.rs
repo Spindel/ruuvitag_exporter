@@ -60,6 +60,7 @@ mod prom {
     }
     use crate::addr;
 
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
         let mut seen = HashMap::new();
         // Because we get duplicate values from ble (both via discovery and other methods) we want
@@ -68,8 +69,8 @@ mod prom {
         // This means we keep a hashmap mapping the mac address to the sequence number, and if the
         // two match, will register it with prometheus. Otherwise we just ignore it.
 
+        let span = span!(Level::TRACE, "sensor_processing").or_current();
         while let Some(sensor) = rx.recv().await {
-            let span = span!(Level::TRACE, "sensor_processing").entered();
             if let (Some(mac_bytes), Some(count)) =
                 (sensor.mac_address(), sensor.measurement_sequence_number())
             {
@@ -83,7 +84,6 @@ mod prom {
                     error!(message = "Got a dupe", count = ?count, mac = %mac);
                 }
             }
-            drop(span);
         }
     }
 
@@ -279,7 +279,7 @@ mod mybus {
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use tokio_stream::StreamExt;
-    use tracing::{debug, info, span, Level};
+    use tracing::{debug, info, span, trace, Level};
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
     type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>;
@@ -344,7 +344,7 @@ mod mybus {
     ) {
         while let Some(v) = removed.next().await {
             if let Ok(data) = v.args() {
-                debug!(message = "Interfaces Removed", data = ?data);
+                debug!(message = "DBus Interface removed", data = ?data);
                 let hashpath = OwnedObjectPath::from(data.object_path);
                 let mut devices = pmap.lock().unwrap();
                 if let Some(dev) = devices.remove(&hashpath) {
@@ -358,6 +358,8 @@ mod mybus {
     pub struct MyDev<'device> {
         device: Device1Proxy<'device>,
         listener: tokio::task::JoinHandle<()>,
+        name: Option<String>,
+        address: Option<String>,
     }
     impl MyDev<'_> {
         pub async fn new(
@@ -377,11 +379,13 @@ mod mybus {
             span.record("device", device.path().to_string());
             span.record("dest", device.destination().to_string());
             span.record("iface", device.interface().to_string());
-            if let Ok(address) = device.address().await {
-                span.record("address", address);
-            }
-            if let Ok(name) = device.name().await {
-                span.record("name", name);
+            let address = device.address().await.ok();
+            let name = device.name().await.ok();
+            if name.is_some() {
+                span.record("name", &name);
+            };
+            if address.is_some() {
+                span.record("address", &address);
             }
             let stream = device.receive_manufacturer_data_changed().await;
 
@@ -396,14 +400,13 @@ mod mybus {
             // Spawn a task to poll this device's stream
             let listener = tokio::spawn(manufacturer_listener(stream, tx));
 
-            let res = Self { device, listener };
+            let res = Self {
+                device,
+                listener,
+                name,
+                address,
+            };
             Ok(res)
-        }
-        pub async fn name(&self) -> String {
-            match self.device.name().await {
-                Ok(name) => name,
-                Err(_) => String::from(""),
-            }
         }
     }
     impl<'device> Drop for MyDev<'device> {
@@ -426,12 +429,24 @@ mod mybus {
             // stream: `f`. Returns `fmt::Result` which indicates whether the
             // operation succeeded or failed. Note that `write!` uses syntax which
             // is very similar to `println!`.
+
+            let dest = self.device.destination();
+            let path = self.device.path();
+            let listen = self.listener.is_finished();
+            write!(f, "MyDev(")?;
+            match self.name.as_ref() {
+                Some(name) => write!(f, "name={}, ", &name)?,
+                None => write!(f, "no_name, ")?,
+            }
+
+            match self.address.as_ref() {
+                Some(addr) => write!(f, "address={}, ", &addr)?,
+                None => write!(f, "no_address, ")?,
+            }
             write!(
                 f,
-                "MyDev( {} {}  listener={})",
-                self.device.destination(),
-                self.device.path(),
-                self.listener.is_finished()
+                "DBus_dst={}, path={}, listener_done={})",
+                dest, path, listen
             )
         }
     }
@@ -464,7 +479,7 @@ mod mybus {
                     let device = MyDev::new(connection.clone(), tx.clone(), object_path.clone())
                         .await
                         .unwrap();
-                    span.record("name", device.name().await);
+                    span.record("name", &device.name);
                     let mut devices = pmap.lock().unwrap();
                     if let Some(old) = devices.insert(object_path, device) {
                         info!(message = "Dropping old device for path", old = ?old);
@@ -504,11 +519,11 @@ mod mybus {
             //           println!("Something happened: {:?}", v.name());
             // println!("Signal: {:?} payload {:?}", v.name(), payload);
             let value = v.get().await;
-            debug!(message = "Device Signal",  name = ?v.name(),  value = ?value);
+            trace!(message = "Device Signal",  name = ?v.name(),  value = ?value);
             if v.name() == "ManufacturerData" {
                 if let Ok(val) = v.get().await {
                     if let Some(sens) = from_manuf(val) {
-                        debug!(message = "Ruuvi data",  data = ?sens);
+                        debug!(message = "Ruuvi data decoded",  data = ?sens);
                         tx.send(sens).await.unwrap();
                     }
                 }
