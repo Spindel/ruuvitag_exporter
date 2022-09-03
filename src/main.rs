@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
 
+mod addr;
 mod bluez;
 
 use ruuvi_sensor_protocol::SensorValues;
@@ -18,7 +19,6 @@ fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> 
 }
 
 mod prom {
-    use btleplug::api::BDAddr;
     use lazy_static::lazy_static;
     use prometheus::{self, GaugeVec, IntCounterVec, IntGaugeVec};
     use prometheus::{
@@ -28,7 +28,7 @@ mod prom {
     use ruuvi_sensor_protocol::{MacAddress, MeasurementSequenceNumber};
     use std::collections::HashMap;
     use tokio::sync::mpsc;
-    use tracing::{info, span, warn, Level};
+    use tracing::{error, info, span, warn, Level};
 
     lazy_static! {
         static ref TEMPERATURE: GaugeVec =
@@ -58,6 +58,7 @@ mod prom {
             register_int_counter_vec!(opts!("signals", "The amount of processed ruuvi signals"), &["mac"]).expect("Failed to initialize");
 
     }
+    use crate::addr;
 
     pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
         let mut seen = HashMap::new();
@@ -72,12 +73,14 @@ mod prom {
             if let (Some(mac_bytes), Some(count)) =
                 (sensor.mac_address(), sensor.measurement_sequence_number())
             {
-                let mac: BDAddr = mac_bytes.into();
+                let mac = addr::Address::from(mac_bytes);
                 let inner = seen.entry(mac).or_insert(0u32);
                 if *inner != count {
                     *inner = count;
                     // We haven't seen it recently
                     register_sensor(&sensor);
+                } else {
+                    error!(message = "Got a dupe", count = ?count, mac = %mac);
                 }
             }
             drop(span);
@@ -108,7 +111,7 @@ mod prom {
         let enter = span.enter();
 
         let mac = if let Some(mac) = sensor.mac_address() {
-            BDAddr::from(mac).to_string()
+            addr::Address::from(mac).to_string()
         } else {
             warn!("Cannot process sensor: {:?}", sensor = sensor);
             return;
