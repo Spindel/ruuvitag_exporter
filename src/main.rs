@@ -9,7 +9,6 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 use zbus::zvariant::OwnedObjectPath;
-use zbus::Connection;
 
 use mybus::device_found;
 use mybus::device_lost;
@@ -448,16 +447,15 @@ mod mybus {
                 if devdata.is_some() {
                     // Clone the data so we can just toss it without caring about lifetimes.
                     // The "biggest" is a string for the path.
-                    let device = MyDev::new(connection.clone(), object_path.clone())
-                        .await
-                        .unwrap();
-                    let old = {
-                        let mut devices = pmap.lock().unwrap();
-                        devices.insert(object_path, device)
-                    };
-                    if let Some(old) = old {
-                        info!(message = "Dropping old device for path", old = ?old);
-                        old.bye().await;
+                    if let Ok(device) = MyDev::new(connection.clone(), object_path.clone()).await {
+                        let old = {
+                            let mut devices = pmap.lock().unwrap();
+                            devices.insert(object_path, device)
+                        };
+                        if let Some(old) = old {
+                            info!(message = "Dropping old device for path", old = ?old);
+                            old.bye().await;
+                        }
                     }
                 }
             }
@@ -506,10 +504,8 @@ mod mybus {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt::init();
-    let mut connection = Connection::system().await?;
+async fn real_main() -> Result<(), Box<dyn Error>> {
+    let mut connection = zbus::Connection::system().await?;
     connection.set_max_queued(1200);
 
     // Mapping of  the device path => device
@@ -548,6 +544,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut futs = tasks
         .into_iter()
         .collect::<FuturesUnordered<JoinHandle<_>>>();
+
     if let Some(task_result) = futs.next().await {
         error!("Something ended and I do not know what or why.");
         match task_result {
@@ -560,4 +557,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         adapter.stop_discovery().await?;
     }
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt::init();
+    real_main().await
 }
