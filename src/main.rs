@@ -1,13 +1,25 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use futures::stream::FuturesUnordered;
+use ruuvi_sensor_protocol::SensorValues;
+use tokio::task::JoinHandle;
+use tokio_stream::StreamExt;
+use tracing::{error, info, warn};
+use zbus::zvariant::OwnedObjectPath;
+use zbus::Connection;
+
+use mybus::device_found;
+use mybus::device_lost;
+use mybus::find_adapters;
+use mybus::find_devices;
+use mybus::start_discovery;
+use mybus::MyDev;
 
 mod addr;
 mod bluez;
-
-use ruuvi_sensor_protocol::SensorValues;
-use tokio_stream::StreamExt;
-use tracing::info;
 
 fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> {
     for (k, v) in manufacturer_data {
@@ -19,16 +31,14 @@ fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> 
 }
 
 mod prom {
+    use crate::addr;
     use lazy_static::lazy_static;
     use prometheus::{self, GaugeVec, IntCounterVec, IntGaugeVec};
     use prometheus::{
         labels, opts, register_gauge_vec, register_int_counter_vec, register_int_gauge_vec,
     };
     use ruuvi_sensor_protocol::SensorValues;
-    use ruuvi_sensor_protocol::{MacAddress, MeasurementSequenceNumber};
-    use std::collections::HashMap;
-    use tokio::sync::mpsc;
-    use tracing::{error, info, span, warn, Level};
+    use tracing::{field, info, span, warn, Level};
 
     lazy_static! {
         static ref TEMPERATURE: GaugeVec =
@@ -50,7 +60,6 @@ mod prom {
         static ref MOVEMENT: IntGaugeVec =
             register_int_gauge_vec!(opts!("movement_counter", "Device movement counter"), &["mac"]).expect("Failed to initialize");
 
-
         static ref ACCEL: GaugeVec =
             register_gauge_vec!(opts!("acceleration", "Acceleration of the device"), &["mac", "axis"]).expect("Failed to initialize");
 
@@ -58,40 +67,13 @@ mod prom {
             register_int_counter_vec!(opts!("signals", "The amount of processed ruuvi signals"), &["mac"]).expect("Failed to initialize");
 
     }
-    use crate::addr;
 
-    #[tracing::instrument(level = "trace", skip_all)]
-    pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
-        let mut seen = HashMap::new();
-        // Because we get duplicate values from ble (both via discovery and other methods) we want
-        // to keep track of the ones we last saw.
-        //
-        // This means we keep a hashmap mapping the mac address to the sequence number, and if the
-        // two match, will register it with prometheus. Otherwise we just ignore it.
-
-        while let Some(sensor) = rx.recv().await {
-            if let (Some(mac_bytes), Some(count)) =
-                (sensor.mac_address(), sensor.measurement_sequence_number())
-            {
-                let mac = addr::Address::from(mac_bytes);
-                let inner = seen.entry(mac).or_insert(0u32);
-                if *inner != count {
-                    *inner = count;
-                    // We haven't seen it recently
-                    register_sensor(&sensor);
-                } else {
-                    error!(message = "Got a dupe", count = ?count, mac = %mac);
-                }
-            }
-        }
-    }
-
-    fn register_sensor(sensor: &SensorValues) {
+    pub(crate) fn register_sensor(sensor: &SensorValues) {
+        // Traits
         use ruuvi_sensor_protocol::{
-            Acceleration, BatteryPotential, Humidity, MovementCounter, Pressure, Temperature,
-            TransmitterPower,
+            Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
+            Temperature, TransmitterPower,
         };
-        use tracing::field;
         // It is important that the keys in the span match what we use in `span.record("key",...)` below.
         let span = span!(
             Level::INFO,
@@ -168,15 +150,15 @@ mod prom {
 }
 
 mod serve {
-    use lazy_static::lazy_static;
     use std::net::SocketAddr;
-    use tracing::{debug, error, info};
 
     use hyper::http::Error;
     use hyper::service::{make_service_fn, service_fn};
     use hyper::{Body, Method, Request, Response, Server};
+    use lazy_static::lazy_static;
     use prometheus::{register_histogram, register_int_counter, register_int_gauge};
     use prometheus::{Histogram, IntCounter, IntGauge};
+    use tracing::{debug, error, info};
 
     lazy_static! {
         static ref HTTP_COUNTER: IntCounter = register_int_counter!(
@@ -268,21 +250,23 @@ mod serve {
 }
 
 mod mybus {
-    use crate::bluez::adapter1::Adapter1Proxy;
-    pub use crate::bluez::device1::Device1Proxy;
-    use crate::from_manuf;
-    use crate::SensorValues;
     use std::collections::HashMap;
     use std::convert::From;
     use std::fmt;
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
+
     use tokio_stream::StreamExt;
     use tracing::{debug, info, trace, warn};
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
+
+    use crate::bluez::adapter1::Adapter1Proxy;
+    use crate::bluez::device1::Device1Proxy;
+    use crate::from_manuf;
+    use crate::prom::register_sensor;
     type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>;
 
+    #[tracing::instrument(level = "info", skip_all)]
     pub async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
         let mut result: Vec<Adapter1Proxy> = Vec::new();
 
@@ -368,10 +352,9 @@ mod mybus {
         address: Option<String>,
     }
     impl MyDev<'_> {
-        #[tracing::instrument(name = "MyDev::new", skip(connection, tx), fields(object_path = object_path.to_string(), name, address))]
+        #[tracing::instrument(name = "MyDev::new", skip(connection), fields(object_path = object_path.to_string(), name, address))]
         pub async fn new(
             connection: zbus::Connection,
-            tx: mpsc::Sender<SensorValues>,
             object_path: OwnedObjectPath,
         ) -> zbus::Result<MyDev<'static>> {
             let device = Device1Proxy::builder(&connection)
@@ -392,12 +375,12 @@ mod mybus {
             debug!(message = "Gathering manufacturer data");
             if let Ok(manuf_data) = device.manufacturer_data().await {
                 if let Some(sens) = from_manuf(manuf_data) {
-                    tx.send(sens).await.unwrap();
+                    register_sensor(&sens);
                 }
             };
             let stream = device.receive_manufacturer_data_changed().await;
             // Spawn a task to poll this device's stream
-            let listener = tokio::spawn(manufacturer_listener(stream, tx));
+            let listener = tokio::spawn(manufacturer_listener(stream));
 
             let res = Self {
                 device,
@@ -447,7 +430,6 @@ mod mybus {
         mut added: zbus::fdo::InterfacesAddedStream<'_>,
         pmap: DeviceHash<'_>,
         connection: zbus::Connection,
-        tx: mpsc::Sender<SensorValues>,
     ) {
         // Data looks like this:
         // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
@@ -466,7 +448,7 @@ mod mybus {
                 if devdata.is_some() {
                     // Clone the data so we can just toss it without caring about lifetimes.
                     // The "biggest" is a string for the path.
-                    let device = MyDev::new(connection.clone(), tx.clone(), object_path.clone())
+                    let device = MyDev::new(connection.clone(), object_path.clone())
                         .await
                         .unwrap();
                     let old = {
@@ -506,7 +488,6 @@ mod mybus {
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn manufacturer_listener(
         mut stream: zbus::PropertyStream<'_, HashMap<u16, Vec<u8>>>,
-        tx: mpsc::Sender<SensorValues>,
     ) {
         while let Some(v) = stream.next().await {
             let value = v.get().await;
@@ -515,7 +496,7 @@ mod mybus {
                 if let Ok(val) = v.get().await {
                     if let Some(sens) = from_manuf(val) {
                         debug!(message = "Ruuvi data decoded",  data = ?sens);
-                        tx.send(sens).await.unwrap();
+                        register_sensor(&sens);
                     }
                 }
             } else {
@@ -527,31 +508,13 @@ mod mybus {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    use mybus::device_found;
-    use mybus::device_lost;
-    use mybus::find_adapters;
-    use mybus::find_devices;
-    use mybus::start_discovery;
-    use mybus::MyDev;
-    use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
-    use tracing::error;
-    use tracing::warn;
-    use zbus::zvariant::OwnedObjectPath;
-    use zbus::Connection;
-
-    use futures::stream::FuturesUnordered;
-    use tokio::task::JoinHandle;
-
     tracing_subscriber::fmt::init();
     let mut connection = Connection::system().await?;
-    connection.set_max_queued(25600);
+    connection.set_max_queued(1200);
 
     // Mapping of  the device path => device
     // Used so we can remove device proxies that are out of date.
     let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, MyDev>::new()));
-
-    let (tx, rx) = mpsc::channel(100);
 
     info!(message = "Setting up interface add and remove signals");
     // Lets try to get some changes on the devices
@@ -568,20 +531,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let tasks = [
         // Spawn event listeners for new and removed devices
         tokio::spawn(device_lost(removed, pmap.clone())),
-        tokio::spawn(device_found(
-            added,
-            pmap.clone(),
-            connection.clone(),
-            tx.clone(),
-        )),
-        // Web server and sensor data processor
-        tokio::spawn(prom::sensor_processor(rx)),
+        tokio::spawn(device_found(added, pmap.clone(), connection.clone())),
+        // Web server
         tokio::spawn(serve::webserver(address)),
     ];
 
     // Spawn event-listeners for all currently visible devices.
     for object_path in find_devices(&connection).await? {
-        let device = MyDev::new(connection.clone(), tx.clone(), object_path.clone()).await?;
+        let device = MyDev::new(connection.clone(), object_path.clone()).await?;
         let mut devices = pmap.lock().unwrap();
         devices.insert(object_path, device);
     }
