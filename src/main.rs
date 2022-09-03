@@ -4,13 +4,9 @@ use std::net::SocketAddr;
 
 mod bluez;
 
-use btleplug::api::{Central, CentralEvent, Peripheral};
-use btleplug::platform::Adapter;
-
 use ruuvi_sensor_protocol::SensorValues;
-use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tracing::{info, span, warn, Level};
+use tracing::info;
 
 fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> {
     for (k, v) in manufacturer_data {
@@ -269,51 +265,6 @@ mod serve {
     }
 }
 
-async fn ruuvi_emitter(
-    central: Adapter,
-    tx: mpsc::Sender<SensorValues>,
-) -> Result<(), Box<dyn Error>> {
-    use btleplug::api::ScanFilter;
-    use std::time::Duration;
-    use tokio::time::timeout;
-    const MINUTE: Duration = Duration::from_secs(60);
-
-    let mut events = central.events().await?;
-
-    loop {
-        let span = span!(Level::TRACE, "ruuvi_emitter");
-        let enter = span.enter();
-        info!(message = "Starting scan on", adapter = ?central, timeout = ?MINUTE);
-        central.start_scan(ScanFilter::default()).await?;
-        // We use the timeout to restart the scan if we don't see any events
-        while let Ok(Some(event)) = timeout(MINUTE, events.next()).await {
-            match event {
-                CentralEvent::ManufacturerDataAdvertisement {
-                    id: _,
-                    manufacturer_data,
-                } => {
-                    if let Some(sensor) = from_manuf(manufacturer_data) {
-                        tx.send(sensor).await?;
-                    }
-                }
-                CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => {
-                    if let Ok(peripheral) = &central.peripheral(&id).await {
-                        if let Ok(Some(props)) = peripheral.properties().await {
-                            if let Some(sensor) = from_manuf(props.manufacturer_data) {
-                                tx.send(sensor).await?;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        warn!(message = "No new events, restarting scanner");
-        drop(enter);
-        central.stop_scan().await?;
-    }
-}
-
 mod mybus {
     use crate::bluez::adapter1::Adapter1Proxy;
     pub use crate::bluez::device1::Device1Proxy;
@@ -325,6 +276,7 @@ mod mybus {
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use tokio_stream::StreamExt;
+    use tracing::{debug, info, span, Level};
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
     type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>;
@@ -358,6 +310,7 @@ mod mybus {
     }
 
     /// Get a list of all Bluetooth devices which have been discovered so far.
+    #[tracing::instrument(level = "info", skip_all)]
     pub async fn find_devices<'device>(
         connection: &zbus::Connection,
     ) -> zbus::Result<Vec<OwnedObjectPath>> {
@@ -381,24 +334,20 @@ mod mybus {
         Ok(result)
     }
 
-    use tracing::{debug, field, info, span, warn, Level};
+    #[tracing::instrument(level = "info", skip_all)]
     pub async fn signals_drop_device(
         mut removed: zbus::fdo::InterfacesRemovedStream<'_>,
         pmap: DeviceHash<'_>,
     ) {
-        let span = span!(Level::TRACE, "drop_device_signal");
-
         while let Some(v) = removed.next().await {
-            let enter = span.enter();
             if let Ok(data) = v.args() {
                 debug!(message = "Interfaces Removed", data = ?data);
                 let hashpath = OwnedObjectPath::from(data.object_path);
                 let mut devices = pmap.lock().unwrap();
                 if let Some(dev) = devices.remove(&hashpath) {
-                    info!(message = "Removed this device", device = ?dev);
+                    info!(message = "Device disconnected", device = %dev);
                 }
             }
-            drop(enter);
         }
     }
 
@@ -413,30 +362,24 @@ mod mybus {
             tx: mpsc::Sender<SensorValues>,
             object_path: OwnedObjectPath,
         ) -> zbus::Result<MyDev<'static>> {
+            let span = span!(Level::INFO, "MyDev::new").or_current();
+
             let device = Device1Proxy::builder(&connection)
                 .destination("org.bluez")?
                 .path(object_path.clone())?
                 .cache_properties(zbus::CacheProperties::Yes)
                 .build()
                 .await?;
-            let span = span!(
-                Level::INFO,
-                "MyDev::new",
-                device = device.path().to_string(),
-                dest = device.destination().to_string(),
-                iface = device.interface().to_string(),
-                name = field::Empty,
-                address = field::Empty,
-            );
-            let enter = span.enter();
+
+            span.record("device", device.path().to_string());
+            span.record("dest", device.destination().to_string());
+            span.record("iface", device.interface().to_string());
             if let Ok(address) = device.address().await {
                 span.record("address", address);
             }
             if let Ok(name) = device.name().await {
                 span.record("name", name);
             }
-            info!(message = "Setting up new device_manufacturer_data_changed signal");
-
             let stream = device.receive_manufacturer_data_changed().await;
 
             // Should we also grab it directly and log it at once?
@@ -451,19 +394,26 @@ mod mybus {
             let listener = tokio::spawn(manufacturer_listener(stream, tx));
 
             let res = Self { device, listener };
-            drop(enter);
             Ok(res)
+        }
+        pub async fn name(&self) -> String {
+            match self.device.name().await {
+                Ok(name) => name,
+                Err(_) => String::from(""),
+            }
         }
     }
     impl<'device> Drop for MyDev<'device> {
         fn drop(&mut self) {
-            println!("> Aborting listener {:?}", self.listener);
+            //println!("> Aborting listener {:?}", self.listener);
             self.listener.abort();
+            /*
             println!(
                 "Drop from {} {}",
                 self.device.destination(),
                 self.device.path()
             );
+            */
         }
     }
     impl<'device> fmt::Display for MyDev<'device> {
@@ -491,10 +441,11 @@ mod mybus {
     ) {
         // Data looks like this:
         // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
+        let span = span!(Level::TRACE, "add_device_signal").or_current();
         while let Some(v) = added.next().await {
             if let Ok(data) = v.args() {
-                //println!("Interfaces Added: data={:?}",  &data);
                 let object_path = OwnedObjectPath::from(data.object_path);
+                span.record("object_path", &object_path.as_str());
 
                 // Filter down to only the pairs that match our interface
                 let devdata =
@@ -510,21 +461,42 @@ mod mybus {
                     let device = MyDev::new(connection.clone(), tx.clone(), object_path.clone())
                         .await
                         .unwrap();
+                    span.record("name", device.name().await);
                     let mut devices = pmap.lock().unwrap();
                     if let Some(old) = devices.insert(object_path, device) {
-                        println!("There was alrady a device in there! {:?}", old);
+                        info!(message = "Dropping old device for path", old = ?old);
                     }
                 }
             }
         }
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
+    pub async fn start_discovery(connection: &zbus::Connection) -> zbus::Result<()> {
+        let adapters = find_adapters(&connection).await?;
+        for adapter in &adapters {
+            let name = adapter.name().await?;
+
+            info!(message = "Powering on", adapter = ?name);
+            adapter.set_powered(true).await?;
+            // discovery filter is a map str=>val with fixed keys
+            // see
+            //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
+            // and
+            //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
+            //
+            adapter.set_discovery_filter(HashMap::new()).await?;
+            info!(message = "Starting discovery on", adapter = ?name);
+            adapter.start_discovery().await?;
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn manufacturer_listener(
         mut stream: zbus::PropertyStream<'_, HashMap<u16, Vec<u8>>>,
         tx: mpsc::Sender<SensorValues>,
     ) {
-        let span = span!(Level::TRACE, "manufacturer_listener");
-        let enter = span.enter();
         while let Some(v) = stream.next().await {
             //           println!("Something happened: {:?}", v.name());
             // println!("Signal: {:?} payload {:?}", v.name(), payload);
@@ -548,11 +520,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     use mybus::find_devices;
     use mybus::signals_add_device;
     use mybus::signals_drop_device;
+    use mybus::start_discovery;
     use mybus::MyDev;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use zbus::zvariant::OwnedObjectPath;
     use zbus::Connection;
+
+    use futures::stream::FuturesUnordered;
+    use tokio::task::JoinHandle;
 
     tracing_subscriber::fmt::init();
     let mut connection = Connection::system().await?;
@@ -564,8 +540,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (tx, rx) = mpsc::channel(100);
 
-    println!("meeh about to manage some proxies for the interface events");
-
+    info!(message = "Setting up interface add and remove signals");
     // Lets try to get some changes on the devices
     let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
         .destination("org.bluez")?
@@ -576,7 +551,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let removed = bluez_root.receive_interfaces_removed().await?;
 
     let address: SocketAddr = "0.0.0.0:9185".parse()?;
-    let to_kill = [
+
+    let tasks = [
         // Spawn event listeners for new and removed devices
         tokio::spawn(signals_drop_device(removed, pmap.clone())),
         tokio::spawn(signals_add_device(
@@ -597,45 +573,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         devices.insert(object_path, device);
     }
 
-    async fn start_discovery(connection: &zbus::Connection) -> zbus::Result<()> {
-        let span = span!(Level::INFO, "start_discovery");
-
-        let enter = span.enter();
-        let adapters = find_adapters(&connection).await?;
-        for adapter in &adapters {
-            let name = adapter.name().await?;
-
-            info!(message = "Powering on", adapter = ?name);
-            adapter.set_powered(true).await?;
-            // discovery filter is a map str=>val with fixed keys
-            // see
-            //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
-            // and
-            //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
-            //
-            adapter.set_discovery_filter(HashMap::new()).await?;
-            info!(message = "Starting discovery on", adapter = ?name);
-            adapter.start_discovery().await?;
-        }
-        drop(enter);
-        Ok(())
-    }
     start_discovery(&connection).await?;
-    use std::time::Duration;
-    const MINUTE: Duration = Duration::from_secs(60);
-    loop {
-        tokio::time::sleep(MINUTE).await;
-    }
 
+    let mut futs = tasks
+        .into_iter()
+        .collect::<FuturesUnordered<JoinHandle<_>>>();
+    if let Some(task_result) = futs.next().await {
+        println!("Something end ed and I'm not sure what!");
+        match task_result {
+            Ok(msg) => println!("Task ended succesfully {:?}", msg),
+            Err(msg) => println!("Task ended badly {}", msg),
+        }
+    }
     // All done, shut down
     for adapter in find_adapters(&connection).await? {
         adapter.stop_discovery().await?;
-    }
-
-    for t in to_kill {
-        t.abort();
-        _ = t.await;
-        //        drop(t);
     }
     Ok(())
 }
