@@ -69,7 +69,6 @@ mod prom {
         // This means we keep a hashmap mapping the mac address to the sequence number, and if the
         // two match, will register it with prometheus. Otherwise we just ignore it.
 
-        let span = span!(Level::TRACE, "sensor_processing").or_current();
         while let Some(sensor) = rx.recv().await {
             if let (Some(mac_bytes), Some(count)) =
                 (sensor.mac_address(), sensor.measurement_sequence_number())
@@ -279,7 +278,7 @@ mod mybus {
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use tokio_stream::StreamExt;
-    use tracing::{debug, info, span, trace, Level};
+    use tracing::{debug, info, trace, warn};
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
     type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>;
@@ -338,7 +337,7 @@ mod mybus {
     }
 
     #[tracing::instrument(level = "info", skip_all)]
-    pub async fn signals_drop_device(
+    pub async fn device_lost(
         mut removed: zbus::fdo::InterfacesRemovedStream<'_>,
         pmap: DeviceHash<'_>,
     ) {
@@ -346,9 +345,16 @@ mod mybus {
             if let Ok(data) = v.args() {
                 debug!(message = "DBus Interface removed", data = ?data);
                 let hashpath = OwnedObjectPath::from(data.object_path);
-                let mut devices = pmap.lock().unwrap();
-                if let Some(dev) = devices.remove(&hashpath) {
-                    info!(message = "Device disconnected", device = %dev);
+                // Since the mutex guard cant be held across await, we take it in a closure and
+                // return the resulting one, before going in.
+                // That way we don't hold the mutex across thread jumps
+                let device = {
+                    let mut devices = pmap.lock().unwrap();
+                    devices.remove(&hashpath)
+                };
+                if let Some(device) = device {
+                    info!(message = "Device disconnected", device = %device);
+                    device.bye().await;
                 }
             }
         }
@@ -362,13 +368,12 @@ mod mybus {
         address: Option<String>,
     }
     impl MyDev<'_> {
+        #[tracing::instrument(name = "MyDev::new", skip(connection, tx), fields(object_path = object_path.to_string(), name, address))]
         pub async fn new(
             connection: zbus::Connection,
             tx: mpsc::Sender<SensorValues>,
             object_path: OwnedObjectPath,
         ) -> zbus::Result<MyDev<'static>> {
-            let span = span!(Level::INFO, "MyDev::new").or_current();
-
             let device = Device1Proxy::builder(&connection)
                 .destination("org.bluez")?
                 .path(object_path.clone())?
@@ -376,27 +381,21 @@ mod mybus {
                 .build()
                 .await?;
 
-            span.record("device", device.path().to_string());
-            span.record("dest", device.destination().to_string());
-            span.record("iface", device.interface().to_string());
             let address = device.address().await.ok();
             let name = device.name().await.ok();
             if name.is_some() {
-                span.record("name", &name);
+                tracing::Span::current().record("name", &name);
             };
             if address.is_some() {
-                span.record("address", &address);
+                tracing::Span::current().record("address", &address);
             }
-            let stream = device.receive_manufacturer_data_changed().await;
-
-            // Should we also grab it directly and log it at once?
-            // IF so, the code looks like this.
-            //
+            debug!(message = "Gathering manufacturer data");
             if let Ok(manuf_data) = device.manufacturer_data().await {
                 if let Some(sens) = from_manuf(manuf_data) {
                     tx.send(sens).await.unwrap();
                 }
             };
+            let stream = device.receive_manufacturer_data_changed().await;
             // Spawn a task to poll this device's stream
             let listener = tokio::spawn(manufacturer_listener(stream, tx));
 
@@ -408,20 +407,18 @@ mod mybus {
             };
             Ok(res)
         }
-    }
-    impl<'device> Drop for MyDev<'device> {
-        fn drop(&mut self) {
-            //println!("> Aborting listener {:?}", self.listener);
-            self.listener.abort();
-            /*
-            println!(
-                "Drop from {} {}",
-                self.device.destination(),
-                self.device.path()
-            );
-            */
+
+        // Tell the tracing infra to use Display formating of "self" as the "device" field.
+        #[tracing::instrument(skip(self), fields(device = %self))]
+        async fn bye(self) {
+            let _ = &self.listener.abort();
+            if (self.listener.await).is_ok() {
+                warn!(message = "Unexpectedly task succeeded before being aborted");
+            }
+            drop(self.device);
         }
     }
+
     impl<'device> fmt::Display for MyDev<'device> {
         // This trait requires `fmt` with this exact signature.
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -430,9 +427,7 @@ mod mybus {
             // operation succeeded or failed. Note that `write!` uses syntax which
             // is very similar to `println!`.
 
-            let dest = self.device.destination();
             let path = self.device.path();
-            let listen = self.listener.is_finished();
             write!(f, "MyDev(")?;
             match self.name.as_ref() {
                 Some(name) => write!(f, "name={}, ", &name)?,
@@ -443,15 +438,12 @@ mod mybus {
                 Some(addr) => write!(f, "address={}, ", &addr)?,
                 None => write!(f, "no_address, ")?,
             }
-            write!(
-                f,
-                "DBus_dst={}, path={}, listener_done={})",
-                dest, path, listen
-            )
+            write!(f, "dbus_path={})", path)
         }
     }
 
-    pub async fn signals_add_device(
+    #[tracing::instrument(skip_all)]
+    pub async fn device_found(
         mut added: zbus::fdo::InterfacesAddedStream<'_>,
         pmap: DeviceHash<'_>,
         connection: zbus::Connection,
@@ -459,11 +451,9 @@ mod mybus {
     ) {
         // Data looks like this:
         // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
-        let span = span!(Level::TRACE, "add_device_signal").or_current();
         while let Some(v) = added.next().await {
             if let Ok(data) = v.args() {
                 let object_path = OwnedObjectPath::from(data.object_path);
-                span.record("object_path", &object_path.as_str());
 
                 // Filter down to only the pairs that match our interface
                 let devdata =
@@ -479,19 +469,22 @@ mod mybus {
                     let device = MyDev::new(connection.clone(), tx.clone(), object_path.clone())
                         .await
                         .unwrap();
-                    span.record("name", &device.name);
-                    let mut devices = pmap.lock().unwrap();
-                    if let Some(old) = devices.insert(object_path, device) {
+                    let old = {
+                        let mut devices = pmap.lock().unwrap();
+                        devices.insert(object_path, device)
+                    };
+                    if let Some(old) = old {
                         info!(message = "Dropping old device for path", old = ?old);
+                        old.bye().await;
                     }
                 }
             }
         }
     }
 
-    #[tracing::instrument(level = "info", skip_all)]
+    #[tracing::instrument(skip_all)]
     pub async fn start_discovery(connection: &zbus::Connection) -> zbus::Result<()> {
-        let adapters = find_adapters(&connection).await?;
+        let adapters = find_adapters(connection).await?;
         for adapter in &adapters {
             let name = adapter.name().await?;
 
@@ -516,8 +509,6 @@ mod mybus {
         tx: mpsc::Sender<SensorValues>,
     ) {
         while let Some(v) = stream.next().await {
-            //           println!("Something happened: {:?}", v.name());
-            // println!("Signal: {:?} payload {:?}", v.name(), payload);
             let value = v.get().await;
             trace!(message = "Device Signal",  name = ?v.name(),  value = ?value);
             if v.name() == "ManufacturerData" {
@@ -527,6 +518,8 @@ mod mybus {
                         tx.send(sens).await.unwrap();
                     }
                 }
+            } else {
+                warn!(message = "Unknown signal", name = ?v.name(), value = ?value);
             }
         }
     }
@@ -534,14 +527,16 @@ mod mybus {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    use mybus::device_found;
+    use mybus::device_lost;
     use mybus::find_adapters;
     use mybus::find_devices;
-    use mybus::signals_add_device;
-    use mybus::signals_drop_device;
     use mybus::start_discovery;
     use mybus::MyDev;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
+    use tracing::error;
+    use tracing::warn;
     use zbus::zvariant::OwnedObjectPath;
     use zbus::Connection;
 
@@ -572,8 +567,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let tasks = [
         // Spawn event listeners for new and removed devices
-        tokio::spawn(signals_drop_device(removed, pmap.clone())),
-        tokio::spawn(signals_add_device(
+        tokio::spawn(device_lost(removed, pmap.clone())),
+        tokio::spawn(device_found(
             added,
             pmap.clone(),
             connection.clone(),
@@ -597,10 +592,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .into_iter()
         .collect::<FuturesUnordered<JoinHandle<_>>>();
     if let Some(task_result) = futs.next().await {
-        println!("Something end ed and I'm not sure what!");
+        error!("Something ended and I do not know what or why.");
         match task_result {
-            Ok(msg) => println!("Task ended succesfully {:?}", msg),
-            Err(msg) => println!("Task ended badly {}", msg),
+            Ok(_) => warn!(message = "Task ended succesfully"),
+            Err(err) => error!(message = "Task ended badly.", err = ?err),
         }
     }
     // All done, shut down
