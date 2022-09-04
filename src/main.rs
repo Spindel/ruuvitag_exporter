@@ -243,9 +243,26 @@ mod serve {
             // returns a Response into a `Service`.
             async { Ok::<_, hyper::Error>(service_fn(router)) }
         });
-        let server = Server::bind(&addr).serve(make_svc);
-        info!(message = "Listening on ", %addr);
-        server.await.expect("Webserver failure");
+
+        let server = match Server::try_bind(&addr) {
+            Ok(server) => {
+                info!(message = "Listening on ", %addr);
+                server
+            }
+            Err(e) => {
+                error!(message = "Failed to bind port", err = ?e);
+                return;
+            }
+        };
+
+        match server.serve(make_svc).await {
+            Ok(_) => {
+                info!("Happy webserver ending");
+            }
+            Err(e) => {
+                error!(message = "Webserver failure", err = ?e);
+            }
+        }
     }
 }
 
