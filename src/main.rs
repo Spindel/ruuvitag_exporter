@@ -390,7 +390,7 @@ mod mybus {
         ) -> zbus::Result<MyDev<'static>> {
             let device = Device1Proxy::builder(&connection)
                 .destination("org.bluez")?
-                .path(object_path.clone())?
+                .path(object_path)?
                 .cache_properties(zbus::CacheProperties::Yes)
                 .build()
                 .await?;
