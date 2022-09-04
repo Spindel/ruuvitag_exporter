@@ -273,7 +273,7 @@ mod mybus {
     use std::sync::{Arc, Mutex};
 
     use tokio_stream::StreamExt;
-    use tracing::{debug, info, trace, warn};
+    use tracing::{debug, error, info, trace, warn};
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
 
@@ -328,12 +328,16 @@ mod mybus {
         let result = tree
             .into_iter()
             .filter_map(|(object_path, mut children)| {
+                // Children is a hashmap<Interface, Data>
                 children
                     .remove(Device1Proxy::INTERFACE)
+                    // data is HashMap<String,Value>
                     .map(|data| (object_path, data))
             })
             .map(|(object_path, _)| object_path)
             .collect();
+        // The above is cumbersomeely visiting all data since I wanted to debug it, and then throws
+        // it away in the last map.  That should be fine as we don't do this often, only at start.
         Ok(result)
     }
 
@@ -344,14 +348,25 @@ mod mybus {
     ) {
         while let Some(v) = removed.next().await {
             if let Ok(data) = v.args() {
-                debug!(message = "DBus Interface removed", data = ?data);
-                let hashpath = OwnedObjectPath::from(data.object_path);
+                let object_path = OwnedObjectPath::from(data.object_path);
+                // Having the debug line below forces us to de-serialize the entire rest even when
+                // we don't care about it.
+                // debug!(message = "DBus Interface removed", data = ?data);
+
                 // Since the mutex guard cant be held across await, we take it in a closure and
                 // return the resulting one, before going in.
                 // That way we don't hold the mutex across thread jumps
                 let device = {
-                    let mut devices = pmap.lock().unwrap();
-                    devices.remove(&hashpath)
+                    let mut devices = match pmap.lock() {
+                        Ok(devices) => devices,
+                        Err(err) => {
+                            error!(message = "Failed to lock device table", err = ?err);
+                            // Returning from this function will make the application end.
+                            // Do that here.
+                            return;
+                        }
+                    };
+                    devices.remove(&object_path)
                 };
                 if let Some(device) = device {
                     info!(message = "Device disconnected", device = %device);
@@ -389,12 +404,14 @@ mod mybus {
             if address.is_some() {
                 tracing::Span::current().record("address", &address);
             }
+
             debug!(message = "Gathering manufacturer data");
             if let Ok(manuf_data) = device.manufacturer_data().await {
                 if let Some(sens) = from_manuf(manuf_data) {
                     register_sensor(&sens);
                 }
             };
+
             let stream = device.receive_manufacturer_data_changed().await;
             // Spawn a task to poll this device's stream
             let listener = tokio::spawn(manufacturer_listener(stream));
@@ -467,7 +484,13 @@ mod mybus {
                     // The "biggest" is a string for the path.
                     if let Ok(device) = MyDev::new(connection.clone(), object_path.clone()).await {
                         let old = {
-                            let mut devices = pmap.lock().unwrap();
+                            let mut devices = match pmap.lock() {
+                                Ok(devices) => devices,
+                                Err(err) => {
+                                    error!(message = "Failed to unlock", err=?err);
+                                    return;
+                                }
+                            };
                             devices.insert(object_path, device)
                         };
                         if let Some(old) = old {
@@ -553,8 +576,16 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     // Spawn event-listeners for all currently visible devices.
     for object_path in find_devices(&connection).await? {
         let device = MyDev::new(connection.clone(), object_path.clone()).await?;
-        let mut devices = pmap.lock().unwrap();
-        devices.insert(object_path, device);
+
+        match pmap.lock() {
+            Ok(mut devices) => {
+                devices.insert(object_path, device);
+            }
+            Err(err) => {
+                error!(message = "Failed to lock device table", err = ?err);
+                // Should I do something more here? Nah.
+            }
+        }
     }
 
     start_discovery(&connection).await?;
