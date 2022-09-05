@@ -483,17 +483,24 @@ mod mybus {
         // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
         while let Some(v) = added.next().await {
             if let Ok(data) = v.args() {
+                let is_adapter = data
+                    .interfaces_and_properties
+                    .iter()
+                    .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE);
+                // We force a new discovery if it's an adapter.
+                if is_adapter {
+                    if let Err(err) = start_discovery(&connection).await {
+                        error!(message = "Failed to start discovery on new adapter",  err=?err, data=?data);
+                    }
+                }
+
+                let is_device = data
+                    .interfaces_and_properties
+                    .iter()
+                    .any(|(interface, _)| interface == &Device1Proxy::INTERFACE);
                 let object_path = OwnedObjectPath::from(data.object_path);
 
-                // Filter down to only the pairs that match our interface
-                let devdata =
-                    data.interfaces_and_properties
-                        .into_iter()
-                        .find_map(|(interface, data)| match interface {
-                            Device1Proxy::INTERFACE => Some(data),
-                            _ => None,
-                        });
-                if devdata.is_some() {
+                if is_device {
                     // Clone the data so we can just toss it without caring about lifetimes.
                     // The "biggest" is a string for the path.
                     if let Ok(device) =
@@ -580,6 +587,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         .path("/")?
         .build()
         .await?;
+
     let added = bluez_root.receive_interfaces_added().await?;
     let removed = bluez_root.receive_interfaces_removed().await?;
 
