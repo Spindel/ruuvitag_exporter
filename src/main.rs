@@ -41,7 +41,7 @@ mod prom {
     };
     use ruuvi_sensor_protocol::SensorValues;
     use tokio::sync::mpsc;
-    use tracing::{field, info, span, warn, Level};
+    use tracing::{error, field, info, span, warn, Level};
 
     lazy_static! {
         static ref TEMPERATURE: GaugeVec =
@@ -73,8 +73,28 @@ mod prom {
 
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
-        while let Some(sensor) = rx.recv().await {
-            register_sensor(&sensor);
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        // Shouldn't this be easier?
+        // The flow here looks really convoluted in my opinion.
+        loop {
+            // If no data arrives within TIMEOUT,  abort the wait.
+            match tokio::time::timeout(TIMEOUT, rx.recv()).await {
+                Err(_) => {
+                    // Timeout happened.
+                    // Log the error and the timeout, then return from this task.
+                    error!(message = "No new values", timeout = TIMEOUT.as_secs());
+                    return;
+                }
+                Ok(rxval) => match rxval {
+                    // some data arrived. All is good
+                    Some(sensor) => register_sensor(&sensor),
+                    // None happens when there are no senders left.
+                    None => {
+                        warn!("No data-emitter tasks left.");
+                        return;
+                    }
+                },
+            }
         }
     }
 
@@ -624,7 +644,6 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         // Sensor data processor
         tokio::spawn(prom::sensor_processor(rx)),
     ];
-
     // Spawn event-listeners for all currently visible devices.
     for dev_proxy in find_devices(&connection).await? {
         let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
