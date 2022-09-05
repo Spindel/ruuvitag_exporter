@@ -327,16 +327,16 @@ mod mybus {
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn find_devices<'device>(
         connection: &zbus::Connection,
-    ) -> zbus::Result<Vec<OwnedObjectPath>> {
+    ) -> zbus::Result<Vec<Device1Proxy<'device>>> {
         let bluez_root = zbus::fdo::ObjectManagerProxy::builder(connection)
             .destination("org.bluez")?
             .path("/")?
             .build()
             .await?;
-        let tree = bluez_root.get_managed_objects().await?;
+        let managed = bluez_root.get_managed_objects().await?;
 
         // Filter down to only the pairs that match our interface
-        let result = tree
+        let object_paths: Vec<OwnedObjectPath> = managed
             .into_iter()
             .filter_map(|(object_path, mut children)| {
                 // Children is a hashmap<Interface, Data>
@@ -347,6 +347,17 @@ mod mybus {
             })
             .map(|(object_path, _)| object_path)
             .collect();
+
+        let mut result: Vec<Device1Proxy> = Vec::new();
+        for object_path in object_paths {
+            let device = Device1Proxy::builder(connection)
+                .destination("org.bluez")?
+                .path(object_path)?
+                .cache_properties(zbus::CacheProperties::Yes)
+                .build()
+                .await?;
+            result.push(device);
+        }
         // The above is cumbersomeely visiting all data since I wanted to debug it, and then throws
         // it away in the last map.  That should be fine as we don't do this often, only at start.
         Ok(result)
@@ -355,7 +366,7 @@ mod mybus {
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn device_lost(
         mut removed: zbus::fdo::InterfacesRemovedStream<'_>,
-        pmap: DeviceHash<'_>,
+        pmap: DeviceHash<'static>,
     ) {
         while let Some(v) = removed.next().await {
             if let Ok(data) = v.args() {
@@ -394,20 +405,12 @@ mod mybus {
         name: Option<String>,
         address: Option<String>,
     }
-    impl MyDev<'_> {
-        #[tracing::instrument(name = "MyDev::new", skip(connection, tx), fields(object_path = object_path.to_string(), name, address))]
+    impl MyDev<'static> {
+        #[tracing::instrument(name = "MyDev::new", skip(device, tx), fields(name, address))]
         pub async fn new(
-            connection: zbus::Connection,
-            object_path: OwnedObjectPath,
+            device: Device1Proxy<'static>,
             tx: mpsc::Sender<SensorValues>,
         ) -> zbus::Result<MyDev<'static>> {
-            let device = Device1Proxy::builder(&connection)
-                .destination("org.bluez")?
-                .path(object_path)?
-                .cache_properties(zbus::CacheProperties::Yes)
-                .build()
-                .await?;
-
             let address = device.address().await.ok();
             let name = device.name().await.ok();
             if name.is_some() {
@@ -437,6 +440,20 @@ mod mybus {
                 address,
             };
             Ok(res)
+        }
+
+        pub async fn from_data(
+            connection: &zbus::Connection,
+            object_path: OwnedObjectPath,
+            tx: mpsc::Sender<SensorValues>,
+        ) -> zbus::Result<MyDev<'static>> {
+            let dev_proxy = Device1Proxy::builder(connection)
+                .destination("org.bluez")?
+                .path(object_path)?
+                .cache_properties(zbus::CacheProperties::Yes)
+                .build()
+                .await?;
+            MyDev::new(dev_proxy, tx).await
         }
 
         // Tell the tracing infra to use Display formating of "self" as the "device" field.
@@ -476,7 +493,7 @@ mod mybus {
     #[tracing::instrument(skip_all)]
     pub async fn device_found(
         mut added: zbus::fdo::InterfacesAddedStream<'_>,
-        pmap: DeviceHash<'_>,
+        pmap: DeviceHash<'static>,
         connection: zbus::Connection,
         tx: mpsc::Sender<SensorValues>,
     ) {
@@ -484,28 +501,27 @@ mod mybus {
         // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
         while let Some(v) = added.next().await {
             if let Ok(data) = v.args() {
-                let is_adapter = data
+                // We force a new discovery if it's an adapter.
+                if data
                     .interfaces_and_properties
                     .iter()
-                    .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE);
-                // We force a new discovery if it's an adapter.
-                if is_adapter {
+                    .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE)
+                {
                     if let Err(err) = start_discovery(&connection).await {
                         error!(message = "Failed to start discovery on new adapter",  err=?err, data=?data);
                     }
                 }
 
-                let is_device = data
+                let object_path = OwnedObjectPath::from(data.object_path);
+                if data
                     .interfaces_and_properties
                     .iter()
-                    .any(|(interface, _)| interface == &Device1Proxy::INTERFACE);
-                let object_path = OwnedObjectPath::from(data.object_path);
-
-                if is_device {
+                    .any(|(interface, _)| interface == &Device1Proxy::INTERFACE)
+                {
                     // Clone the data so we can just toss it without caring about lifetimes.
                     // The "biggest" is a string for the path.
                     if let Ok(device) =
-                        MyDev::new(connection.clone(), object_path.clone(), tx.clone()).await
+                        MyDev::from_data(&connection, object_path.clone(), tx.clone()).await
                     {
                         let old = {
                             let mut devices = match pmap.lock() {
@@ -610,8 +626,9 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     ];
 
     // Spawn event-listeners for all currently visible devices.
-    for object_path in find_devices(&connection).await? {
-        let device = MyDev::new(connection.clone(), object_path.clone(), tx.clone()).await?;
+    for dev_proxy in find_devices(&connection).await? {
+        let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
+        let device = MyDev::new(dev_proxy, tx.clone()).await?;
 
         match pmap.lock() {
             Ok(mut devices) => {
