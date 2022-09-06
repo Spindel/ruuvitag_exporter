@@ -645,6 +645,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(prom::sensor_processor(rx)),
     ];
     // Spawn event-listeners for all currently visible devices.
+
     for dev_proxy in find_devices(&connection).await? {
         let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
         let device = MyDev::new(dev_proxy, tx.clone()).await?;
@@ -660,7 +661,10 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    start_discovery(&connection).await?;
+    if let Err(err) = start_discovery(&connection).await {
+        error!(message = "Failed to start discovery. Airplane mode?", err = %err);
+        return Err(Box::new(err));
+    }
 
     let mut futs = tasks
         .into_iter()
