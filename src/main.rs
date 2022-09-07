@@ -260,6 +260,9 @@ mod serve {
             _ => four_oh_four()?,
         };
         drop(timer);
+        // This yield is really only to make clippy pedantic mode happy,
+        // as this function had no await statements in it.
+        tokio::task::yield_now().await;
         Ok(resp)
     }
 
