@@ -562,24 +562,30 @@ mod mybus {
             }
         }
     }
+    #[tracing::instrument(skip_all, fields(name))]
+    pub async fn adapter_start_discovery(adapter: &Adapter1Proxy<'_>) -> zbus::Result<()> {
+        let name = adapter.name().await?;
+        tracing::Span::current().record("name", &name);
+
+        info!(message = "Powering adapter on");
+        adapter.set_powered(true).await?;
+        // discovery filter is a map str=>val with fixed keys
+        // see
+        //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
+        // and
+        //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
+        //
+        adapter.set_discovery_filter(HashMap::new()).await?;
+        info!(message = "Starting adapter discovery");
+        adapter.start_discovery().await?;
+        Ok(())
+    }
 
     #[tracing::instrument(skip_all)]
     pub async fn start_discovery(connection: &zbus::Connection) -> zbus::Result<()> {
         let adapters = find_adapters(connection).await?;
         for adapter in &adapters {
-            let name = adapter.name().await?;
-
-            info!(message = "Powering on", adapter = ?name);
-            adapter.set_powered(true).await?;
-            // discovery filter is a map str=>val with fixed keys
-            // see
-            //  https://github.com/bluez-rs/bluez-async/blob/main/bluez-async/src/lib.rs#L143
-            // and
-            //  https://github.com/Vudentz/BlueZ/blob/master/doc/adapter-api.txt#L49 for docs
-            //
-            adapter.set_discovery_filter(HashMap::new()).await?;
-            info!(message = "Starting discovery on", adapter = ?name);
-            adapter.start_discovery().await?;
+            adapter_start_discovery(adapter).await?;
         }
         Ok(())
     }
