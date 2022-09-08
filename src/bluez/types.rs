@@ -15,16 +15,19 @@ enum Transport {
 
 #[derive(Deserialize, Serialize, Type, PartialEq, Debug)]
 #[zvariant(signature = "dict")]
-struct DiscoveryFilter {
+pub struct DiscoveryFilter {
     #[serde(rename = "UUIDs")]
-    Uuids: Vec<String>, // Should be vec of bluetooth UUID
+    pub uuids: Vec<String>, // Should be vec of bluetooth UUID
     #[serde(rename = "RSSI")]
-    Rssi: i16,          // RSSI threshold value.
+    pub rssi: i16,          // RSSI threshold value.
     #[serde(rename = "Pathloss")]
-    Pathloss: i16,      // RSSI threshold value.
+    pub pathloss: i16,      // RSSI threshold value.
     #[serde(rename = "Transport")]
-    Transport: Transport,
-    DuplicateData: bool,  // default true
-    Discoverable: bool,  // default False
-    Pattern: Option<String>,    // "" means match all, applied as OR.
+    pub transport: Transport,
+    #[serde(rename = "DuplicateData")]
+    pub duplicatedata: bool,  // default true
+    #[serde(rename = "Discoverable")]
+    pub discoverable: bool,  // default False
+    #[serde(rename = "Pattern")]
+    pub pattern: Option<String>,    // "" means match all, applied as OR.
 } 
