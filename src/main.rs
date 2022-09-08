@@ -11,7 +11,6 @@ use tokio_stream::StreamExt;
 
 use tracing::{error, info, warn};
 use zbus::zvariant::OwnedObjectPath;
-use zbus::Connection;
 
 use mybus::device_found;
 use mybus::device_lost;
@@ -618,7 +617,7 @@ mod mybus {
 }
 
 async fn real_main() -> Result<(), Box<dyn Error>> {
-    let mut connection = Connection::system().await?;
+    let mut connection = zbus::Connection::system().await?;
     connection.set_max_queued(1200);
 
     // Mapping of  the device path => device
