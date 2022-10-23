@@ -123,7 +123,7 @@ mod prom {
         let mac = if let Some(mac) = sensor.mac_address() {
             Address::from(mac).to_string()
         } else {
-            warn!("Cannot process sensor: {:?}", sensor = sensor);
+            warn!("Cannot process sensor: {sensor:?}", sensor = sensor);
             return;
         };
         // Tracing has a hard time with String, this wraps it as a borrowed value
