@@ -19,7 +19,7 @@ use mybus::find_devices;
 use mybus::start_discovery;
 use mybus::MyDev;
 
-mod addr;
+mod bluer;
 mod bluez;
 
 fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> {
@@ -32,7 +32,7 @@ fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> 
 }
 
 mod prom {
-    use crate::addr;
+    use crate::bluer::Address;
     use lazy_static::lazy_static;
     use prometheus::{self, GaugeVec, IntCounterVec, IntGaugeVec};
     use prometheus::{
@@ -121,7 +121,7 @@ mod prom {
         let enter = span.enter();
 
         let mac = if let Some(mac) = sensor.mac_address() {
-            addr::Address::from(mac).to_string()
+            Address::from(mac).to_string()
         } else {
             warn!("Cannot process sensor: {:?}", sensor = sensor);
             return;
