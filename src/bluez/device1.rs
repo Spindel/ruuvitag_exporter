@@ -19,7 +19,7 @@
 //!
 //! …consequently `zbus-xmlgen` did not generate code for the above interfaces.
 
-#![allow(non_snake_case)]
+#[allow(non_snake_case)]
 use zbus::dbus_proxy;
 
 #[dbus_proxy(interface = "org.bluez.Device1")]
@@ -31,13 +31,13 @@ trait Device1 {
     fn connect(&self) -> zbus::Result<()>;
 
     /// ConnectProfile method
-    fn connect_profile(&self, UUID: &str) -> zbus::Result<()>;
+    fn connect_profile(&self, uuid: &str) -> zbus::Result<()>;
 
     /// Disconnect method
     fn disconnect(&self) -> zbus::Result<()>;
 
     /// DisconnectProfile method
-    fn disconnect_profile(&self, UUID: &str) -> zbus::Result<()>;
+    fn disconnect_profile(&self, uuid: &str) -> zbus::Result<()>;
 
     /// Pair method
     fn pair(&self) -> zbus::Result<()>;

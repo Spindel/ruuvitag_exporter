@@ -19,7 +19,7 @@
 //!
 //! …consequently `zbus-xmlgen` did not generate code for the above interfaces.
 
-#![allow(non_snake_case)]
+#[allow(non_snake_case)]
 use zbus::dbus_proxy;
 
 #[dbus_proxy(interface = "org.bluez.AgentManager1")]
@@ -44,7 +44,7 @@ trait ProfileManager1 {
     fn register_profile(
         &self,
         profile: &zbus::zvariant::ObjectPath<'_>,
-        UUID: &str,
+        uuid: &str,
         options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>,
     ) -> zbus::Result<()>;
 
