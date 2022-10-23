@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -32,6 +33,7 @@ fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> 
 }
 
 mod prom {
+    #![forbid(unsafe_code)]
     use crate::bluer::Address;
     use lazy_static::lazy_static;
     use prometheus::{self, GaugeVec, IntCounterVec, IntGaugeVec};
@@ -179,6 +181,7 @@ mod prom {
 }
 
 mod serve {
+    #![forbid(unsafe_code)]
     use std::net::SocketAddr;
 
     use hyper::http::Error;
@@ -299,6 +302,7 @@ mod serve {
 }
 
 mod mybus {
+    #![forbid(unsafe_code)]
     use std::collections::HashMap;
     use std::convert::From;
     use std::fmt;

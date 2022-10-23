@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 /// License: BSD 2-clause
 /// Taken from:
 ///    <https://docs.rs/bluer/0.15.0/src/bluer/lib.rs.html#751>
