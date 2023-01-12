@@ -67,6 +67,9 @@ mod prom {
         static ref ACCEL: GaugeVec =
             register_gauge_vec!(opts!("acceleration", "Acceleration of the device"), &["mac", "axis"]).expect("Failed to initialize");
 
+        static ref MEASURE_NO: IntGaugeVec =
+            register_int_gauge_vec!(opts!("measurement_sequence_no", "The sequence number of ruuvi-emitted signals"), &["mac"]).expect("Failed to initialize");
+
         static ref COUNT: IntCounterVec =
             register_int_counter_vec!(opts!("signals", "The amount of processed ruuvi signals"), &["mac"]).expect("Failed to initialize");
 
@@ -102,8 +105,8 @@ mod prom {
     fn register_sensor(sensor: &SensorValues) {
         // Traits
         use ruuvi_sensor_protocol::{
-            Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
-            Temperature, TransmitterPower,
+            Acceleration, BatteryPotential, Humidity, MacAddress, MeasurementSequenceNumber,
+            MovementCounter, Pressure, Temperature, TransmitterPower,
         };
         // It is important that the keys in the span match what we use in `span.record("key",...)` below.
         let span = span!(
@@ -118,7 +121,8 @@ mod prom {
             txpow = field::Empty,
             accel_x = field::Empty,
             accel_y = field::Empty,
-            accel_z = field::Empty
+            accel_z = field::Empty,
+            measure_no = field::Empty
         );
         let enter = span.enter();
 
@@ -174,6 +178,13 @@ mod prom {
             ACCEL.with_label_values(&[&mac, "x"]).set(accel_x);
             ACCEL.with_label_values(&[&mac, "y"]).set(accel_y);
             ACCEL.with_label_values(&[&mac, "z"]).set(accel_z);
+        }
+        if let Some(measure_no) = sensor.measurement_sequence_number() {
+            span.record("measure_no", measure_no);
+            // It is supposed to be a counter, but a ruuvitag may be restarted while the prometheus
+            // logger is running, and then we would go backwards, so it is implemented as a value
+            // here.
+            MEASURE_NO.with_label_values(&[&mac]).set(measure_no.into());
         }
         info!(message = "New measurement");
         drop(enter);
