@@ -138,43 +138,43 @@ mod prom {
         COUNT.with_label_values(&[&mac]).inc();
         if let Some(humidity) = sensor.humidity_as_ppm() {
             let humidity = f64::from(humidity) / 10000.0;
-            span.record("humidity", &humidity);
+            span.record("humidity", humidity);
             HUMIDITY.with_label_values(&[&mac]).set(humidity);
         }
 
         if let Some(pressure) = sensor.pressure_as_pascals() {
             let pressure = f64::from(pressure) / 1000.0;
-            span.record("pressure", &pressure);
+            span.record("pressure", pressure);
             PRESSURE.with_label_values(&[&mac]).set(pressure);
         }
         if let Some(temp) = sensor.temperature_as_millicelsius() {
             let temp = f64::from(temp) / 1000.0;
-            span.record("temperature", &temp);
+            span.record("temperature", temp);
             TEMPERATURE.with_label_values(&[&mac]).set(temp);
         }
 
         if let Some(volts) = sensor.battery_potential_as_millivolts() {
             let volts = f64::from(volts) / 1000.0;
-            span.record("volts", &volts);
+            span.record("volts", volts);
             POTENTIAL.with_label_values(&[&mac]).set(volts);
         }
         if let Some(txpow) = sensor.tx_power_as_dbm() {
-            span.record("txpow", &txpow);
+            span.record("txpow", txpow);
             TXPOW.with_label_values(&[&mac]).set(i64::from(txpow));
         }
 
         if let Some(movement) = sensor.movement_counter() {
             let movement = i64::from(movement);
-            span.record("movement", &movement);
+            span.record("movement", movement);
             MOVEMENT.with_label_values(&[&mac]).set(movement);
         }
         if let Some(accel) = sensor.acceleration_vector_as_milli_g() {
             let accel_x = f64::from(accel.0) / 1000.0;
             let accel_y = f64::from(accel.1) / 1000.0;
             let accel_z = f64::from(accel.2) / 1000.0;
-            span.record("accel_x", &accel_x);
-            span.record("accel_y", &accel_y);
-            span.record("accel_z", &accel_z);
+            span.record("accel_x", accel_x);
+            span.record("accel_y", accel_y);
+            span.record("accel_z", accel_z);
             ACCEL.with_label_values(&[&mac, "x"]).set(accel_x);
             ACCEL.with_label_values(&[&mac, "y"]).set(accel_y);
             ACCEL.with_label_values(&[&mac, "z"]).set(accel_z);
@@ -523,7 +523,7 @@ mod mybus {
                 Some(addr) => write!(f, "address={}, ", &addr)?,
                 None => write!(f, "no_address, ")?,
             }
-            write!(f, "dbus_path={})", path)
+            write!(f, "dbus_path={path})")
         }
     }
 
