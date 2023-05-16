@@ -70,6 +70,29 @@ mod prom {
 
     }
 
+    #[tracing::instrument]
+    pub(crate) async fn spammer() {
+        use prometheus::core::Collector;
+        use prometheus::proto::Gauge;
+        use prometheus::proto::Metric;
+        let _desired = [
+            "temperature",
+            "humidity",
+            "pressure",
+            "battery_potential",
+            "tx_power",
+        ];
+        let rest = std::time::Duration::from_secs(13);
+        loop {
+            let t = TEMPERATURE.collect();
+            if let Some(temp) = t.first().unwrap().get_metric().first() {
+                let value = temp.get_gauge().get_value();
+                info!(temperature = ?value, "Logging temperature");
+            }
+            tokio::time::sleep(rest).await;
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -651,6 +674,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(serve::webserver(address)),
         // Sensor data processor
         tokio::spawn(prom::sensor_processor(rx)),
+        tokio::spawn(prom::spammer()),
     ];
     // Spawn event-listeners for all currently visible devices.
 
