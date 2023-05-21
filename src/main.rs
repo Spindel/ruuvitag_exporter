@@ -70,57 +70,7 @@ mod prom {
 
     }
 
-    #[tracing::instrument]
-    pub(crate) async fn spammer() {
-        use prometheus::core::Collector;
-        use prometheus::proto::Gauge;
-        use prometheus::proto::Metric;
-        let _desired = [
-            "temperature",
-            "humidity",
-            "pressure",
-            "battery_potential",
-            "tx_power",
-        ];
-        let rest = std::time::Duration::from_secs(13);
-        loop {
-            let t = TEMPERATURE.collect();
-            if let Some(temp) = t.first().unwrap().get_metric().first() {
-                let value = temp.get_gauge().get_value();
-                info!(temperature = ?value, "Logging temperature");
-            }
-            tokio::time::sleep(rest).await;
-        }
-    }
-
-    #[tracing::instrument(level = "trace", skip_all)]
-    pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-        // Shouldn't this be easier?
-        // The flow here looks really convoluted in my opinion.
-        loop {
-            // If no data arrives within TIMEOUT,  abort the wait.
-            match tokio::time::timeout(TIMEOUT, rx.recv()).await {
-                Err(_) => {
-                    // Timeout happened.
-                    // Log the error and the timeout, then return from this task.
-                    error!(message = "No new values", timeout = TIMEOUT.as_secs());
-                    return;
-                }
-                Ok(rxval) => match rxval {
-                    // some data arrived. All is good
-                    Some(sensor) => register_sensor(&sensor),
-                    // None happens when there are no senders left.
-                    None => {
-                        warn!("No data-emitter tasks left.");
-                        return;
-                    }
-                },
-            }
-        }
-    }
-
-    fn register_sensor(sensor: &SensorValues) {
+    pub fn register_sensor(sensor: &SensorValues) {
         // Traits
         use ruuvi_sensor_protocol::{
             Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
@@ -146,7 +96,7 @@ mod prom {
         let mac = if let Some(mac) = sensor.mac_address() {
             addr::Address::from(mac).to_string()
         } else {
-            warn!("Cannot process sensor: {:?}", sensor = sensor);
+            warn!(sensor = ?sensor, "Cannot process sensor");
             return;
         };
         // Tracing has a hard time with String, this wraps it as a borrowed value
@@ -195,6 +145,169 @@ mod prom {
             ACCEL.with_label_values(&[&mac, "x"]).set(accel_x);
             ACCEL.with_label_values(&[&mac, "y"]).set(accel_y);
             ACCEL.with_label_values(&[&mac, "z"]).set(accel_z);
+        }
+        info!(message = "New measurement");
+        drop(enter);
+    }
+
+    pub struct SensorActor {
+        receiver: mpsc::Receiver<SensorValues>,
+        sender: mpsc::Sender<SensorValues>,
+    }
+    impl SensorActor {
+        pub fn new(
+            receiver: mpsc::Receiver<SensorValues>,
+            sender: mpsc::Sender<SensorValues>,
+        ) -> Self {
+            SensorActor { receiver, sender }
+        }
+        pub async fn handle_message(
+            &mut self,
+            msg: SensorValues,
+        ) -> Result<(), tokio::sync::mpsc::error::SendError<SensorValues>> {
+            register_sensor(&msg);
+            self.sender.send(msg).await
+        }
+    }
+    pub async fn run_sensor_actor(mut actor: SensorActor) {
+        while let Some(msg) = actor.receiver.recv().await {
+            actor.handle_message(msg);
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        // Shouldn't this be easier?
+        // The flow here looks really convoluted in my opinion.
+        loop {
+            // If no data arrives within TIMEOUT,  abort the wait.
+            match tokio::time::timeout(TIMEOUT, rx.recv()).await {
+                Err(_) => {
+                    // Timeout happened.
+                    // Log the error and the timeout, then return from this task.
+                    error!(message = "No new values", timeout = TIMEOUT.as_secs());
+                    return;
+                }
+                Ok(rxval) => match rxval {
+                    // some data arrived. All is good
+                    Some(sensor) => {
+                        // register_sensor(&sensor);
+                        modio_log_sensor(true, &sensor).await;
+                    }
+                    // None happens when there are no senders left.
+                    None => {
+                        warn!("No data-emitter tasks left.");
+                        return;
+                    }
+                },
+            }
+        }
+    }
+
+    #[tracing::instrument]
+    async fn modio_log_sensor(session: bool, sensor: &SensorValues) {
+        let connection = if session {
+            zbus::Connection::session().await.unwrap()
+        } else {
+            zbus::Connection::system().await.unwrap()
+        };
+        let ipc = fsipc::legacy::fsipcProxy::builder(&connection)
+            .build()
+            .await
+            .unwrap();
+
+        // Traits
+        use ruuvi_sensor_protocol::{
+            Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
+            Temperature, TransmitterPower,
+        };
+        // It is important that the keys in the span match what we use in `span.record("key",...)` below.
+        let span = span!(
+            Level::INFO,
+            "modio_log_sensor",
+            mac = field::Empty,
+            temperature = field::Empty,
+            humidity = field::Empty,
+            pressure = field::Empty,
+            movement = field::Empty,
+            volts = field::Empty,
+            txpow = field::Empty,
+            accel_x = field::Empty,
+            accel_y = field::Empty,
+            accel_z = field::Empty
+        );
+        let enter = span.enter();
+
+        let mac = if let Some(mac) = sensor.mac_address() {
+            addr::Address::from(mac).to_string().replace(":", "")
+        } else {
+            warn!(sensor = ?sensor, "Cannot process sensor");
+            return;
+        };
+        // Tracing has a hard time with String, this wraps it as a borrowed value
+        span.record("mac", &tracing::field::display(&mac));
+
+        if let Some(humidity) = sensor.humidity_as_ppm() {
+            let humidity = f64::from(humidity) / 10000.0;
+            span.record("humidity", &humidity);
+            ipc.store(&format!("ruuvi.{mac}.humidity"), &humidity.to_string())
+                .await
+                .unwrap();
+        }
+
+        if let Some(pressure) = sensor.pressure_as_pascals() {
+            let pressure = f64::from(pressure) / 1000.0;
+            span.record("pressure", &pressure);
+            ipc.store(&format!("ruuvi.{mac}.pressure"), &pressure.to_string())
+                .await
+                .unwrap();
+        }
+        if let Some(temp) = sensor.temperature_as_millicelsius() {
+            let temp = f64::from(temp) / 1000.0;
+            span.record("temperature", &temp);
+            ipc.store(&format!("ruuvi.{mac}.temperature"), &temp.to_string())
+                .await
+                .unwrap();
+        }
+
+        if let Some(volts) = sensor.battery_potential_as_millivolts() {
+            let volts = f64::from(volts) / 1000.0;
+            span.record("volts", &volts);
+            ipc.store(&format!("ruuvi.{mac}.volts"), &volts.to_string())
+                .await
+                .unwrap();
+        }
+        if let Some(txpow) = sensor.tx_power_as_dbm() {
+            span.record("txpow", &txpow);
+            ipc.store(&format!("ruuvi.{mac}.txpow"), &txpow.to_string())
+                .await
+                .unwrap();
+        }
+
+        if let Some(movement) = sensor.movement_counter() {
+            let movement = i64::from(movement);
+            span.record("movement", &movement);
+            ipc.store(&format!("ruuvi.{mac}.movement"), &movement.to_string())
+                .await
+                .unwrap();
+        }
+        if let Some(accel) = sensor.acceleration_vector_as_milli_g() {
+            let accel_x = f64::from(accel.0) / 1000.0;
+            let accel_y = f64::from(accel.1) / 1000.0;
+            let accel_z = f64::from(accel.2) / 1000.0;
+            span.record("accel_x", &accel_x);
+            span.record("accel_y", &accel_y);
+            span.record("accel_z", &accel_z);
+            ipc.store(&format!("ruuvi.{mac}.accel_x"), &accel_x.to_string())
+                .await
+                .unwrap();
+            ipc.store(&format!("ruuvi.{mac}.accel.y"), &accel_y.to_string())
+                .await
+                .unwrap();
+            ipc.store(&format!("ruuvi.{mac}.accel.z"), &accel_z.to_string())
+                .await
+                .unwrap();
         }
         info!(message = "New measurement");
         drop(enter);
@@ -647,6 +760,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     // Used so we can remove device proxies that are out of date.
     let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, MyDev>::new()));
     let (tx, rx) = mpsc::channel(100);
+    let (tx2, rx2) = mpsc::channel(100);
 
     info!(message = "Setting up interface add and remove signals");
     // Lets try to get some changes on the devices
@@ -661,6 +775,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 
     let address: SocketAddr = "0.0.0.0:9185".parse()?;
 
+    let actors = prom::SensorActor::new(rx, tx2);
     let tasks = [
         // Spawn event listeners for new and removed devices
         tokio::spawn(device_lost(removed, pmap.clone())),
@@ -673,8 +788,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         // Web server
         tokio::spawn(serve::webserver(address)),
         // Sensor data processor
-        tokio::spawn(prom::sensor_processor(rx)),
-        tokio::spawn(prom::spammer()),
+        tokio::spawn(prom::run_sensor_actor(actors)),
     ];
     // Spawn event-listeners for all currently visible devices.
 
