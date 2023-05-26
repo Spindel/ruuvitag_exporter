@@ -12,8 +12,6 @@ use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 use zbus::zvariant::OwnedObjectPath;
 
-use mybus::device_found;
-use mybus::device_lost;
 use mybus::find_adapters;
 use mybus::find_devices;
 use mybus::start_discovery;
@@ -171,7 +169,10 @@ mod prom {
     }
     pub async fn run_sensor_actor(mut actor: SensorActor) {
         while let Some(msg) = actor.receiver.recv().await {
-            actor.handle_message(msg);
+            actor
+                .handle_message(msg)
+                .await
+                .expect("Unknown failure in channel");
         }
     }
 
@@ -191,9 +192,9 @@ mod prom {
                 }
                 Ok(rxval) => match rxval {
                     // some data arrived. All is good
-                    Some(sensor) => {
+                    Some(_sensor) => {
                         // register_sensor(&sensor);
-                        modio_log_sensor(true, &sensor).await;
+                        // modio_log_sensor(true, &sensor).await;
                     }
                     // None happens when there are no senders left.
                     None => {
@@ -204,14 +205,52 @@ mod prom {
             }
         }
     }
+}
+
+mod modio {
+    use crate::addr;
+
+    use ruuvi_sensor_protocol::SensorValues;
+    use tokio::sync::mpsc;
+    use tracing::{field, info, span, warn, Level};
+
+    pub struct SensorActor {
+        receiver: mpsc::Receiver<SensorValues>,
+        sender: mpsc::Sender<SensorValues>,
+        connection: zbus::Connection,
+    }
+    impl SensorActor {
+        pub fn new(
+            receiver: mpsc::Receiver<SensorValues>,
+            sender: mpsc::Sender<SensorValues>,
+            connection: zbus::Connection,
+        ) -> Self {
+            SensorActor {
+                receiver,
+                sender,
+                connection,
+            }
+        }
+
+        pub async fn handle_message(
+            &mut self,
+            msg: SensorValues,
+        ) -> Result<(), tokio::sync::mpsc::error::SendError<SensorValues>> {
+            modio_log_sensor(&self.connection, &msg);
+            self.sender.send(msg).await
+        }
+    }
+    pub async fn run_sensor_actor(mut actor: SensorActor) {
+        while let Some(msg) = actor.receiver.recv().await {
+            actor
+                .handle_message(msg)
+                .await
+                .expect("Unknown failure in channel");
+        }
+    }
 
     #[tracing::instrument]
-    async fn modio_log_sensor(session: bool, sensor: &SensorValues) {
-        let connection = if session {
-            zbus::Connection::session().await.unwrap()
-        } else {
-            zbus::Connection::system().await.unwrap()
-        };
+    async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) {
         let ipc = fsipc::legacy::fsipcProxy::builder(&connection)
             .build()
             .await
@@ -605,7 +644,7 @@ mod mybus {
             object_path: OwnedObjectPath,
             tx: mpsc::Sender<SensorValues>,
         ) -> zbus::Result<MyDev<'static>> {
-            let dev_proxy = Device1Proxy::builder(connection)
+            let dev_proxy = Device1Proxy::builder(&connection)
                 .destination("org.bluez")?
                 .path(object_path)?
                 .cache_properties(zbus::CacheProperties::Yes)
@@ -616,7 +655,7 @@ mod mybus {
 
         // Tell the tracing infra to use Display formating of "self" as the "device" field.
         #[tracing::instrument(skip(self), fields(device = %self))]
-        async fn bye(self) {
+        pub async fn bye(self) {
             let _ = &self.listener.abort();
             if (self.listener.await).is_ok() {
                 warn!(message = "Unexpectedly task succeeded before being aborted");
@@ -687,6 +726,8 @@ mod mybus {
                                 Err(err) => {
                                     error!(message = "Failed to unlock", err=?err);
                                     return;
+                                    error!(message = "Failed to unlock", err=?err);
+                                    return;
                                 }
                             };
                             devices.insert(object_path, device)
@@ -700,6 +741,7 @@ mod mybus {
             }
         }
     }
+
     #[tracing::instrument(skip_all, fields(name))]
     pub async fn adapter_start_discovery(adapter: &Adapter1Proxy<'_>) -> zbus::Result<()> {
         let name = adapter.name().await?;
@@ -751,6 +793,150 @@ mod mybus {
         }
     }
 }
+/*
+struct LostFound {
+    tx: mpsc::Sender<SensorValues>,
+}
+
+impl LostFound {
+    pub fn new(tx: mpsc::Sender<SensorValues>) -> Self {
+        // Mapping of  the device path => device
+        // Used so we can remove device proxies that are out of date.
+        LostFound {
+            tx,
+        }
+    }
+
+    // Spawn event-listeners for all currently visible devices.
+    pub async fn discover_devices(
+        &self,
+        connection: zbus::Connection,
+        pmap: Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>,
+    ) -> Result<(), Box<dyn Error>> {
+        for dev_proxy in find_devices(&connection).await? {
+            let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
+            let device = MyDev::new(dev_proxy, self.tx.clone()).await?;
+
+            match pmap.lock() {
+                Ok(mut devices) => {
+                    devices.insert(object_path, device);
+                }
+                Err(err) => {
+                    error!(message = "Failed to lock device table", err = ?err);
+                    // Should I do something more here? Nah.
+                }
+            }
+        }
+        Ok(())
+    }
+    pub async fn handle_removed_signal(&self,
+        connection: zbus::Connection,
+        pmap: Arc<Mutex<HashMap<OwnedObjectPath, MyDev>>>,
+        data: zbus::fdo::InterfacesRemovedArgs<'_>) {
+        let object_path = OwnedObjectPath::from(data.object_path);
+        // Having the debug line below forces us to de-serialize the entire rest even when
+        // we don't care about it.
+        // debug!(message = "DBus Interface removed", data = ?data);
+
+        // Since the mutex guard cant be held across await, we take it in a closure and
+        // return the resulting one, before going in.
+        // That way we don't hold the mutex across thread jumps
+        let pmap = pmap.clone();
+        {
+            if let Ok(mut devices) = pmap.lock() {
+                if let Some(device) = devices.remove(&object_path) {
+                    async move {
+                        info!(message = "Device disconnected", device = %device);
+                        device.bye().await;
+                    }
+                }
+            }
+        }
+    }
+    async fn add_device(&mut self,
+
+        connection: zbus::Connection,
+        pmap: Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>,
+                        object_path: OwnedObjectPath, device: MyDev<'_>) {
+        if let Ok(devices) = pmap.lock() {
+            let Some(old) = devices.insert(object_path, device) {
+                info!(message = "Dropping old device for path", old = ?old);
+                old.bye().await;
+            }
+        }
+    }
+    pub async fn handle_added_signal(&self,
+        connection: zbus::Connection,
+        pmap: Arc<Mutex<HashMap<OwnedObjectPath, MyDev>>>,
+                                     data: zbus::fdo::InterfacesAddedArgs<'_>) -> Result<(), zbus::Error> {
+        use crate::bluez::device1::Device1Proxy;
+        use crate::bluez::adapter1::Adapter1Proxy;
+        use zbus::ProxyDefault; // Trait
+        // Data looks like this:
+        // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
+            // We force a new discovery if it's an adapter.
+            if data
+                .interfaces_and_properties
+                .iter()
+                .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE)
+            {
+                if let Err(err) = start_discovery(&connection).await {
+                    error!(message = "Failed to start discovery on new adapter",  err=?err, data=?data);
+                }
+            }
+
+            let object_path = OwnedObjectPath::from(data.object_path);
+            if data
+                .interfaces_and_properties
+                .iter()
+                .any(|(interface, _)| interface == &Device1Proxy::INTERFACE)
+            {
+                // Clone the data so we can just toss it without caring about lifetimes.
+                // The "biggest" is a string for the path.
+                if let Ok(device) = MyDev::from_data(&connection, object_path.clone(), self.tx.clone()).await
+                {
+                    if let Ok(mut devices) = pmap.clone().lock() {
+                        if let Some(old) = devices.insert(object_path, device) {
+                            info!(message = "Dropping old device for path", old = ?old);
+                            old.bye().await;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+}
+
+*/
+/*
+pub async fn run_lostfound_actor(actor: LostFound) {
+    // Lets try to get some changes on the devices
+    let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&actor.connection)
+        .destination("org.bluez").unwrap()
+        .path("/").unwrap()
+        .build()
+        .await.unwrap();
+    let mut removed = bluez_root.receive_interfaces_removed().await.unwrap();
+    let mut added = bluez_root.receive_interfaces_added().await.unwrap();
+    loop {
+        tokio::select! {
+            Some(rem_sig) = removed.next() => {
+                if let Ok(data) = rem_sig.args() {
+                    actor.handle_removed_signal(data).await
+                }
+            },
+            Some(add_sig) = added.next() => {
+                if let Ok(data) = add_sig.args() {
+                    actor.handle_added_signal(data).await.unwrap()
+                }
+            },
+            else => break,
+        }
+    }
+}
+*/
+use mybus::device_found;
+use mybus::device_lost;
 
 async fn real_main() -> Result<(), Box<dyn Error>> {
     let mut connection = zbus::Connection::system().await?;
@@ -759,8 +945,10 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     // Mapping of  the device path => device
     // Used so we can remove device proxies that are out of date.
     let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, MyDev>::new()));
+
     let (tx, rx) = mpsc::channel(100);
     let (tx2, rx2) = mpsc::channel(100);
+    let (tx3, _rx3) = mpsc::channel(100);
 
     info!(message = "Setting up interface add and remove signals");
     // Lets try to get some changes on the devices
@@ -775,9 +963,17 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 
     let address: SocketAddr = "0.0.0.0:9185".parse()?;
 
-    let actors = prom::SensorActor::new(rx, tx2);
+    // modio connection stuff
+    let session = std::env::args().any(|arg| arg == "--session");
+    let modio_connection = if session {
+        zbus::Connection::session().await.unwrap()
+    } else {
+        zbus::Connection::system().await.unwrap()
+    };
+
+    let prom_actor = prom::SensorActor::new(rx, tx2);
+    let modio_actor = modio::SensorActor::new(rx2, tx3, modio_connection);
     let tasks = [
-        // Spawn event listeners for new and removed devices
         tokio::spawn(device_lost(removed, pmap.clone())),
         tokio::spawn(device_found(
             added,
@@ -788,10 +984,9 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         // Web server
         tokio::spawn(serve::webserver(address)),
         // Sensor data processor
-        tokio::spawn(prom::run_sensor_actor(actors)),
+        tokio::spawn(prom::run_sensor_actor(prom_actor)),
+        tokio::spawn(modio::run_sensor_actor(modio_actor)),
     ];
-    // Spawn event-listeners for all currently visible devices.
-
     for dev_proxy in find_devices(&connection).await? {
         let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
         let device = MyDev::new(dev_proxy, tx.clone()).await?;
