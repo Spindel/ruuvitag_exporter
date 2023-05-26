@@ -236,7 +236,7 @@ mod modio {
             &mut self,
             msg: SensorValues,
         ) -> Result<(), tokio::sync::mpsc::error::SendError<SensorValues>> {
-            modio_log_sensor(&self.connection, &msg);
+            modio_log_sensor(&self.connection, &msg).await;
             self.sender.send(msg).await
         }
     }
@@ -250,106 +250,67 @@ mod modio {
     }
 
     #[tracing::instrument]
-    async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) {
-        let ipc = fsipc::legacy::fsipcProxy::builder(&connection)
-            .build()
-            .await
-            .unwrap();
-
+    async fn decode_sensor(sensor: &SensorValues) -> Vec<(String, String)> {
         // Traits
         use ruuvi_sensor_protocol::{
             Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
             Temperature, TransmitterPower,
         };
-        // It is important that the keys in the span match what we use in `span.record("key",...)` below.
-        let span = span!(
-            Level::INFO,
-            "modio_log_sensor",
-            mac = field::Empty,
-            temperature = field::Empty,
-            humidity = field::Empty,
-            pressure = field::Empty,
-            movement = field::Empty,
-            volts = field::Empty,
-            txpow = field::Empty,
-            accel_x = field::Empty,
-            accel_y = field::Empty,
-            accel_z = field::Empty
-        );
-        let enter = span.enter();
+        let mut result = Vec::with_capacity(10);
 
         let mac = if let Some(mac) = sensor.mac_address() {
             addr::Address::from(mac).to_string().replace(":", "")
         } else {
             warn!(sensor = ?sensor, "Cannot process sensor");
-            return;
+            return result; // TODO: Use an error here
         };
-        // Tracing has a hard time with String, this wraps it as a borrowed value
-        span.record("mac", &tracing::field::display(&mac));
-
         if let Some(humidity) = sensor.humidity_as_ppm() {
-            let humidity = f64::from(humidity) / 10000.0;
-            span.record("humidity", &humidity);
-            ipc.store(&format!("ruuvi.{mac}.humidity"), &humidity.to_string())
-                .await
-                .unwrap();
+            let humidity = (f64::from(humidity) / 10000.0).to_string();
+            result.push((format!("ruuvi.{mac}.humidity"), humidity));
         }
 
         if let Some(pressure) = sensor.pressure_as_pascals() {
-            let pressure = f64::from(pressure) / 1000.0;
-            span.record("pressure", &pressure);
-            ipc.store(&format!("ruuvi.{mac}.pressure"), &pressure.to_string())
-                .await
-                .unwrap();
+            let pressure = (f64::from(pressure) / 1000.0).to_string();
+            result.push((format!("ruuvi.{mac}.pressure"), pressure));
         }
-        if let Some(temp) = sensor.temperature_as_millicelsius() {
-            let temp = f64::from(temp) / 1000.0;
-            span.record("temperature", &temp);
-            ipc.store(&format!("ruuvi.{mac}.temperature"), &temp.to_string())
-                .await
-                .unwrap();
+        if let Some(temperature) = sensor.temperature_as_millicelsius() {
+            let temperature = (f64::from(temperature) / 1000.0).to_string();
+            result.push((format!("ruuvi.{mac}.temperature"), temperature));
         }
 
         if let Some(volts) = sensor.battery_potential_as_millivolts() {
-            let volts = f64::from(volts) / 1000.0;
-            span.record("volts", &volts);
-            ipc.store(&format!("ruuvi.{mac}.volts"), &volts.to_string())
-                .await
-                .unwrap();
+            let volts = (f64::from(volts) / 1000.0).to_string();
+            result.push((format!("ruuvi.{mac}.volts"), volts));
         }
         if let Some(txpow) = sensor.tx_power_as_dbm() {
-            span.record("txpow", &txpow);
-            ipc.store(&format!("ruuvi.{mac}.txpow"), &txpow.to_string())
-                .await
-                .unwrap();
+            result.push((format!("ruuvi.{mac}.txpow"), txpow.to_string()));
         }
 
         if let Some(movement) = sensor.movement_counter() {
-            let movement = i64::from(movement);
-            span.record("movement", &movement);
-            ipc.store(&format!("ruuvi.{mac}.movement"), &movement.to_string())
-                .await
-                .unwrap();
+            let movement = i64::from(movement).to_string();
+            result.push((format!("ruuvi.{mac}.movement"), movement));
         }
         if let Some(accel) = sensor.acceleration_vector_as_milli_g() {
-            let accel_x = f64::from(accel.0) / 1000.0;
-            let accel_y = f64::from(accel.1) / 1000.0;
-            let accel_z = f64::from(accel.2) / 1000.0;
-            span.record("accel_x", &accel_x);
-            span.record("accel_y", &accel_y);
-            span.record("accel_z", &accel_z);
-            ipc.store(&format!("ruuvi.{mac}.accel_x"), &accel_x.to_string())
-                .await
-                .unwrap();
-            ipc.store(&format!("ruuvi.{mac}.accel.y"), &accel_y.to_string())
-                .await
-                .unwrap();
-            ipc.store(&format!("ruuvi.{mac}.accel.z"), &accel_z.to_string())
-                .await
-                .unwrap();
+            let accel_x = (f64::from(accel.0) / 1000.0).to_string();
+            let accel_y = (f64::from(accel.1) / 1000.0).to_string();
+            let accel_z = (f64::from(accel.2) / 1000.0).to_string();
+            result.push((format!("ruuvi.{mac}.accel_x"), accel_x));
+            result.push((format!("ruuvi.{mac}.accel_y"), accel_y));
+            result.push((format!("ruuvi.{mac}.accel_z"), accel_z));
         }
-        info!(message = "New measurement");
-        drop(enter);
+        result
+    }
+
+    #[tracing::instrument]
+    async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) {
+        let ipc = fsipc::legacy::fsipcProxy::builder(&connection)
+            .build()
+            .await
+            .unwrap();
+        let data = decode_sensor(sensor).await;
+        for (key, val) in data {
+            ipc.store(&key, &val).await.unwrap();
+        }
     }
 }
 
