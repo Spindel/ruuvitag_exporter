@@ -212,7 +212,7 @@ mod modio {
 
     use ruuvi_sensor_protocol::SensorValues;
     use tokio::sync::mpsc;
-    use tracing::{field, info, span, warn, Level};
+    use tracing::{info, warn};
 
     pub struct SensorActor {
         receiver: mpsc::Receiver<SensorValues>,
@@ -249,56 +249,137 @@ mod modio {
         }
     }
 
-    #[tracing::instrument]
-    async fn decode_sensor(sensor: &SensorValues) -> Vec<(String, String)> {
-        // Traits
-        use ruuvi_sensor_protocol::{
-            Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
-            Temperature, TransmitterPower,
-        };
-        let mut result = Vec::with_capacity(10);
+    #[derive(Debug)]
+    struct DecodeError;
+    #[derive(PartialEq)]
+    enum DecidedSensorState {
+        Humidity,
+        Pressure,
+        Temperature,
+        Volts,
+        Txpow,
+        Movement,
+        AccelX,
+        AccelY,
+        AccelZ,
+        Done,
+    }
 
-        let mac = if let Some(mac) = sensor.mac_address() {
-            addr::Address::from(mac).to_string().replace(":", "")
-        } else {
-            warn!(sensor = ?sensor, "Cannot process sensor");
-            return result; // TODO: Use an error here
-        };
-        if let Some(humidity) = sensor.humidity_as_ppm() {
-            let humidity = (f64::from(humidity) / 10000.0).to_string();
-            result.push((format!("ruuvi.{mac}.humidity"), humidity));
+    impl DecidedSensorState {
+        pub fn as_str(&self) -> &str {
+            use DecidedSensorState::*;
+            match self {
+                Humidity => "humidity",
+                Pressure => "pressure",
+                Temperature => "temperature",
+                Volts => "volts",
+                Txpow => "txpow",
+                Movement => "movement",
+                AccelX => "accel_x",
+                AccelY => "accel_y",
+                AccelZ => "accel_z",
+                Done => "__done",
+            }
+        }
+    }
+
+    struct DecodedSensor<'sensor> {
+        state: DecidedSensorState,
+        sensor: &'sensor SensorValues,
+    }
+    // Traits
+    use ruuvi_sensor_protocol::{
+        Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
+        Temperature, TransmitterPower,
+    };
+
+    impl DecodedSensor<'_> {
+        fn new<'sensor>(sensor: &'sensor SensorValues) -> DecodedSensor<'sensor> {
+            DecodedSensor {
+                sensor: sensor,
+                state: DecidedSensorState::Humidity,
+            }
         }
 
-        if let Some(pressure) = sensor.pressure_as_pascals() {
-            let pressure = (f64::from(pressure) / 1000.0).to_string();
-            result.push((format!("ruuvi.{mac}.pressure"), pressure));
-        }
-        if let Some(temperature) = sensor.temperature_as_millicelsius() {
-            let temperature = (f64::from(temperature) / 1000.0).to_string();
-            result.push((format!("ruuvi.{mac}.temperature"), temperature));
-        }
-
-        if let Some(volts) = sensor.battery_potential_as_millivolts() {
-            let volts = (f64::from(volts) / 1000.0).to_string();
-            result.push((format!("ruuvi.{mac}.volts"), volts));
-        }
-        if let Some(txpow) = sensor.tx_power_as_dbm() {
-            result.push((format!("ruuvi.{mac}.txpow"), txpow.to_string()));
+        fn mac(&self) -> Option<String> {
+            self.sensor
+                .mac_address()
+                .map(addr::Address::from)
+                .map(|addr| addr.to_string())
+                .map(|s| s.replace(':', ""))
         }
 
-        if let Some(movement) = sensor.movement_counter() {
-            let movement = i64::from(movement).to_string();
-            result.push((format!("ruuvi.{mac}.movement"), movement));
+        /// Decode the current value (marked by internal state variable) as an Option<f64>
+        fn decode(&self) -> Option<f64> {
+            match self.state {
+                DecidedSensorState::Humidity => self
+                    .sensor
+                    .humidity_as_ppm()
+                    .map(f64::from)
+                    .map(|num| num / 10000.0),
+                DecidedSensorState::Pressure => self
+                    .sensor
+                    .pressure_as_pascals()
+                    .map(f64::from)
+                    .map(|num| num / 1000.0),
+                DecidedSensorState::Temperature => self
+                    .sensor
+                    .temperature_as_millicelsius()
+                    .map(f64::from)
+                    .map(|num| num / 1000.0),
+                DecidedSensorState::Volts => self
+                    .sensor
+                    .battery_potential_as_millivolts()
+                    .map(f64::from)
+                    .map(|num| num / 1000.0),
+                DecidedSensorState::Txpow => self.sensor.tx_power_as_dbm().map(f64::from),
+                DecidedSensorState::Movement => self.sensor.movement_counter().map(f64::from),
+                DecidedSensorState::AccelX => self
+                    .sensor
+                    .acceleration_vector_as_milli_g()
+                    .map(|vec| f64::from(vec.0))
+                    .map(|num| num / 1000.0),
+                DecidedSensorState::AccelY => self
+                    .sensor
+                    .acceleration_vector_as_milli_g()
+                    .map(|vec| f64::from(vec.1))
+                    .map(|num| num / 1000.0),
+                DecidedSensorState::AccelZ => self
+                    .sensor
+                    .acceleration_vector_as_milli_g()
+                    .map(|vec| f64::from(vec.2))
+                    .map(|num| num / 1000.0),
+                DecidedSensorState::Done => None,
+            }
         }
-        if let Some(accel) = sensor.acceleration_vector_as_milli_g() {
-            let accel_x = (f64::from(accel.0) / 1000.0).to_string();
-            let accel_y = (f64::from(accel.1) / 1000.0).to_string();
-            let accel_z = (f64::from(accel.2) / 1000.0).to_string();
-            result.push((format!("ruuvi.{mac}.accel_x"), accel_x));
-            result.push((format!("ruuvi.{mac}.accel_y"), accel_y));
-            result.push((format!("ruuvi.{mac}.accel_z"), accel_z));
+    }
+
+    impl Iterator for DecodedSensor<'_> {
+        type Item = (String, String);
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.state == DecidedSensorState::Done {
+                return None;
+            }
+            let step = self.state.as_str().to_string();
+            let val = self.decode();
+            self.state = match self.state {
+                DecidedSensorState::Humidity => DecidedSensorState::Pressure,
+                DecidedSensorState::Pressure => DecidedSensorState::Temperature,
+                DecidedSensorState::Temperature => DecidedSensorState::Volts,
+                DecidedSensorState::Volts => DecidedSensorState::Txpow,
+                DecidedSensorState::Txpow => DecidedSensorState::Movement,
+                DecidedSensorState::Movement => DecidedSensorState::AccelX,
+                DecidedSensorState::AccelX => DecidedSensorState::AccelY,
+                DecidedSensorState::AccelY => DecidedSensorState::AccelZ,
+                DecidedSensorState::AccelZ => DecidedSensorState::Done,
+                DecidedSensorState::Done => DecidedSensorState::Done,
+            };
+            if let Some(val) = val {
+                Some((step, val.to_string()))
+            } else {
+                None
+            }
         }
-        result
     }
 
     #[tracing::instrument]
@@ -307,9 +388,13 @@ mod modio {
             .build()
             .await
             .unwrap();
-        let data = decode_sensor(sensor).await;
-        for (key, val) in data {
-            ipc.store(&key, &val).await.unwrap();
+        let decoder = DecodedSensor::new(&sensor);
+        if let Some(mac) = decoder.mac() {
+            for (name, val) in decoder {
+                info!(value = val, name = name, "have a dedoded v");
+                let key = format!("ruuvi.{mac}.{name}");
+                ipc.store(&key, &val).await.unwrap();
+            }
         }
     }
 }
