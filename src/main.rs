@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 
 use futures::stream::FuturesUnordered;
 use ruuvi_sensor_protocol::SensorValues;
@@ -10,15 +9,14 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use tracing::{error, info, warn};
-use zbus::zvariant::OwnedObjectPath;
 
 use mybus::find_adapters;
-use mybus::find_devices;
 use mybus::start_discovery;
-use mybus::MyDev;
 
 mod addr;
 mod bluez;
+mod prom;
+mod serve;
 
 fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> {
     for (k, v) in manufacturer_data {
@@ -29,190 +27,12 @@ fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> 
     None
 }
 
-mod prom {
-    use crate::addr;
-    use lazy_static::lazy_static;
-    use prometheus::{self, GaugeVec, IntCounterVec, IntGaugeVec};
-    use prometheus::{
-        labels, opts, register_gauge_vec, register_int_counter_vec, register_int_gauge_vec,
-    };
-    use ruuvi_sensor_protocol::SensorValues;
-    use tokio::sync::mpsc;
-    use tracing::{error, field, info, span, warn, Level};
-
-    lazy_static! {
-        static ref TEMPERATURE: GaugeVec =
-            register_gauge_vec!(opts!("temperature", "Temperature in Celsius", labels!("unit" => "Cel")), &["mac"]).expect("Failed to initialize");
-
-        static ref HUMIDITY: GaugeVec =
-            register_gauge_vec!(opts!("humidity", "Humidity in percent", labels!("unit" => "%RH")), &["mac"]).expect("Failed to initialize");
-
-        static ref PRESSURE: GaugeVec =
-            register_gauge_vec!(opts!("pressure", "Pressure in pascals", labels!("unit" => "Pa")), &["mac"]).expect("Failed to initialize");
-
-        static ref POTENTIAL: GaugeVec =
-            register_gauge_vec!(opts!("battery_potential", "Battery potential in volts", labels!("unit" => "V")), &["mac"]).expect("Failed to initialize");
-
-        static ref TXPOW: IntGaugeVec =
-            register_int_gauge_vec!(opts!("tx_power", "BLE TX power as dBm", labels!("unit" => "dBm")), &["mac"]).expect("Failed to initialize");
-
-        // It wraps too often to be a good counter.
-        static ref MOVEMENT: IntGaugeVec =
-            register_int_gauge_vec!(opts!("movement_counter", "Device movement counter"), &["mac"]).expect("Failed to initialize");
-
-        static ref ACCEL: GaugeVec =
-            register_gauge_vec!(opts!("acceleration", "Acceleration of the device"), &["mac", "axis"]).expect("Failed to initialize");
-
-        static ref COUNT: IntCounterVec =
-            register_int_counter_vec!(opts!("signals", "The amount of processed ruuvi signals"), &["mac"]).expect("Failed to initialize");
-
-    }
-
-    pub fn register_sensor(sensor: &SensorValues) {
-        // Traits
-        use ruuvi_sensor_protocol::{
-            Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
-            Temperature, TransmitterPower,
-        };
-        // It is important that the keys in the span match what we use in `span.record("key",...)` below.
-        let span = span!(
-            Level::INFO,
-            "register_data",
-            mac = field::Empty,
-            temperature = field::Empty,
-            humidity = field::Empty,
-            pressure = field::Empty,
-            movement = field::Empty,
-            volts = field::Empty,
-            txpow = field::Empty,
-            accel_x = field::Empty,
-            accel_y = field::Empty,
-            accel_z = field::Empty
-        );
-        let enter = span.enter();
-
-        let mac = if let Some(mac) = sensor.mac_address() {
-            addr::Address::from(mac).to_string()
-        } else {
-            warn!(sensor = ?sensor, "Cannot process sensor");
-            return;
-        };
-        // Tracing has a hard time with String, this wraps it as a borrowed value
-        span.record("mac", &tracing::field::display(&mac));
-
-        COUNT.with_label_values(&[&mac]).inc();
-        if let Some(humidity) = sensor.humidity_as_ppm() {
-            let humidity = f64::from(humidity) / 10000.0;
-            span.record("humidity", &humidity);
-            HUMIDITY.with_label_values(&[&mac]).set(humidity);
-        }
-
-        if let Some(pressure) = sensor.pressure_as_pascals() {
-            let pressure = f64::from(pressure) / 1000.0;
-            span.record("pressure", &pressure);
-            PRESSURE.with_label_values(&[&mac]).set(pressure);
-        }
-        if let Some(temp) = sensor.temperature_as_millicelsius() {
-            let temp = f64::from(temp) / 1000.0;
-            span.record("temperature", &temp);
-            TEMPERATURE.with_label_values(&[&mac]).set(temp);
-        }
-
-        if let Some(volts) = sensor.battery_potential_as_millivolts() {
-            let volts = f64::from(volts) / 1000.0;
-            span.record("volts", &volts);
-            POTENTIAL.with_label_values(&[&mac]).set(volts);
-        }
-        if let Some(txpow) = sensor.tx_power_as_dbm() {
-            span.record("txpow", &txpow);
-            TXPOW.with_label_values(&[&mac]).set(i64::from(txpow));
-        }
-
-        if let Some(movement) = sensor.movement_counter() {
-            let movement = i64::from(movement);
-            span.record("movement", &movement);
-            MOVEMENT.with_label_values(&[&mac]).set(movement);
-        }
-        if let Some(accel) = sensor.acceleration_vector_as_milli_g() {
-            let accel_x = f64::from(accel.0) / 1000.0;
-            let accel_y = f64::from(accel.1) / 1000.0;
-            let accel_z = f64::from(accel.2) / 1000.0;
-            span.record("accel_x", &accel_x);
-            span.record("accel_y", &accel_y);
-            span.record("accel_z", &accel_z);
-            ACCEL.with_label_values(&[&mac, "x"]).set(accel_x);
-            ACCEL.with_label_values(&[&mac, "y"]).set(accel_y);
-            ACCEL.with_label_values(&[&mac, "z"]).set(accel_z);
-        }
-        info!(message = "New measurement");
-        drop(enter);
-    }
-
-    pub struct SensorActor {
-        receiver: mpsc::Receiver<SensorValues>,
-        sender: mpsc::Sender<SensorValues>,
-    }
-    impl SensorActor {
-        pub fn new(
-            receiver: mpsc::Receiver<SensorValues>,
-            sender: mpsc::Sender<SensorValues>,
-        ) -> Self {
-            SensorActor { receiver, sender }
-        }
-        pub async fn handle_message(
-            &mut self,
-            msg: SensorValues,
-        ) -> Result<(), tokio::sync::mpsc::error::SendError<SensorValues>> {
-            register_sensor(&msg);
-            self.sender.send(msg).await
-        }
-    }
-    pub async fn run_sensor_actor(mut actor: SensorActor) {
-        while let Some(msg) = actor.receiver.recv().await {
-            actor
-                .handle_message(msg)
-                .await
-                .expect("Unknown failure in channel");
-        }
-    }
-
-    #[tracing::instrument(level = "trace", skip_all)]
-    pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-        // Shouldn't this be easier?
-        // The flow here looks really convoluted in my opinion.
-        loop {
-            // If no data arrives within TIMEOUT,  abort the wait.
-            match tokio::time::timeout(TIMEOUT, rx.recv()).await {
-                Err(_) => {
-                    // Timeout happened.
-                    // Log the error and the timeout, then return from this task.
-                    error!(message = "No new values", timeout = TIMEOUT.as_secs());
-                    return;
-                }
-                Ok(rxval) => match rxval {
-                    // some data arrived. All is good
-                    Some(_sensor) => {
-                        // register_sensor(&sensor);
-                        // modio_log_sensor(true, &sensor).await;
-                    }
-                    // None happens when there are no senders left.
-                    None => {
-                        warn!("No data-emitter tasks left.");
-                        return;
-                    }
-                },
-            }
-        }
-    }
-}
-
 mod modio {
     use crate::addr;
 
     use ruuvi_sensor_protocol::SensorValues;
     use tokio::sync::mpsc;
-    use tracing::{info, warn};
+    use tracing::info;
 
     pub struct SensorActor {
         receiver: mpsc::Receiver<SensorValues>,
@@ -240,6 +60,7 @@ mod modio {
             self.sender.send(msg).await
         }
     }
+
     pub async fn run_sensor_actor(mut actor: SensorActor) {
         while let Some(msg) = actor.receiver.recv().await {
             actor
@@ -281,6 +102,21 @@ mod modio {
                 Done => "__done",
             }
         }
+        pub fn senml_str(&self) -> &str {
+            use DecidedSensorState::*;
+            match self {
+                Humidity => "/",
+                Pressure => "Pa",
+                Temperature => "Cel",
+                Volts => "V",
+                Txpow => "dBm",
+                Movement => "count",
+                AccelX => "g",
+                AccelY => "g",
+                AccelZ => "g",
+                Done => "",
+            }
+        }
     }
 
     struct DecodedSensor<'sensor> {
@@ -317,11 +153,8 @@ mod modio {
                     .humidity_as_ppm()
                     .map(f64::from)
                     .map(|num| num / 10000.0),
-                DecidedSensorState::Pressure => self
-                    .sensor
-                    .pressure_as_pascals()
-                    .map(f64::from)
-                    .map(|num| num / 1000.0),
+                DecidedSensorState::Pressure => self.sensor.pressure_as_pascals().map(f64::from),
+                // .map(|num| num / 1000.0),
                 DecidedSensorState::Temperature => self
                     .sensor
                     .temperature_as_millicelsius()
@@ -355,12 +188,13 @@ mod modio {
     }
 
     impl Iterator for DecodedSensor<'_> {
-        type Item = (String, String);
+        type Item = (String, String, String);
         fn next(&mut self) -> Option<Self::Item> {
             if self.state == DecidedSensorState::Done {
                 return None;
             }
             let step = self.state.as_str().to_string();
+            let unit = self.state.senml_str().to_string();
             let val = self.decode();
             self.state = match self.state {
                 DecidedSensorState::Humidity => DecidedSensorState::Pressure,
@@ -374,11 +208,7 @@ mod modio {
                 DecidedSensorState::AccelZ => DecidedSensorState::Done,
                 DecidedSensorState::Done => DecidedSensorState::Done,
             };
-            if let Some(val) = val {
-                Some((step, val.to_string()))
-            } else {
-                None
-            }
+            val.map(|val| (step, val.to_string(), unit))
         }
     }
 
@@ -390,8 +220,8 @@ mod modio {
             .unwrap();
         let decoder = DecodedSensor::new(&sensor);
         if let Some(mac) = decoder.mac() {
-            for (name, val) in decoder {
-                info!(value = val, name = name, "have a dedoded v");
+            for (name, val, unit) in decoder {
+                info!(value = val, name = name, unit = unit, "have a decoded v");
                 let key = format!("ruuvi.{mac}.{name}");
                 ipc.store(&key, &val).await.unwrap();
             }
@@ -399,129 +229,9 @@ mod modio {
     }
 }
 
-mod serve {
-    use std::net::SocketAddr;
-
-    use hyper::http::Error;
-    use hyper::service::{make_service_fn, service_fn};
-    use hyper::{Body, Method, Request, Response, Server};
-    use lazy_static::lazy_static;
-    use prometheus::{register_histogram, register_int_counter, register_int_gauge};
-    use prometheus::{Histogram, IntCounter, IntGauge};
-    use tracing::{debug, error, info};
-
-    lazy_static! {
-        static ref HTTP_COUNTER: IntCounter = register_int_counter!(
-            "ruuvi_exporter_requests_total",
-            "Number of HTTP requests received."
-        )
-        .expect("Could not create HTTP_COUNTER metric. This should never fail.");
-        static ref HTTP_BODY_GAUGE: IntGauge = register_int_gauge!(
-            "ruuvi_exporter_response_size_bytes",
-            "The HTTP response sizes in bytes."
-        )
-        .expect("Could not create HTTP_BODY_GAUGE metric. This should never fail.");
-        static ref HTTP_REQ_HISTOGRAM: Histogram = register_histogram!(
-            "ruuvi_exporter_request_duration_seconds",
-            "The HTTP request latencies in seconds."
-        )
-        .expect("Could not create HTTP_REQ_HISTOGRAM metric. This should never fail.");
-    }
-
-    #[tracing::instrument]
-    fn prometheus_to_response() -> Result<Response<Body>, Error> {
-        let metric_families = prometheus::gather();
-        debug!(
-            message = "Generating text output for metrics",
-            count = metric_families.len()
-        );
-        let encoder = prometheus::TextEncoder::new();
-        let resp = match encoder.encode_to_string(&metric_families) {
-            Ok(body_text) => {
-                HTTP_BODY_GAUGE.set(body_text.len() as i64);
-                let body = Body::from(body_text);
-                Response::new(body)
-            }
-            Err(error) => {
-                error!(message = "Error serializing prometheus data", err = %error);
-                let body = Body::from("Error serializing to prometheus");
-                Response::builder().status(500).body(body)?
-            }
-        };
-        Ok(resp)
-    }
-
-    fn redirect() -> Result<Response<Body>, Error> {
-        debug!(
-            message = "Redirecting user",
-            location = "/metrics",
-            status = 301
-        );
-        let body = Body::from("Go to /metrics \n");
-        let resp = Response::builder()
-            .status(301)
-            .header("Location", "/metrics")
-            .body(body)?;
-        Ok(resp)
-    }
-
-    fn four_oh_four() -> Result<Response<Body>, Error> {
-        debug!(message = "Redirecting user", status = 404);
-        let resp = Response::builder().status(404).body(Body::empty())?;
-        Ok(resp)
-    }
-
-    async fn router(req: Request<Body>) -> Result<Response<Body>, Error> {
-        HTTP_COUNTER.inc();
-        let timer = HTTP_REQ_HISTOGRAM.start_timer();
-        let resp = match (req.method(), req.uri().path()) {
-            (&Method::GET, "/metrics") => prometheus_to_response()?,
-            (&Method::GET, "/") => redirect()?,
-            _ => four_oh_four()?,
-        };
-        drop(timer);
-        // This yield is really only to make clippy pedantic mode happy,
-        // as this function had no await statements in it.
-        tokio::task::yield_now().await;
-        Ok(resp)
-    }
-
-    #[tracing::instrument]
-    pub(crate) async fn webserver(addr: SocketAddr) {
-        // For every connection, we must make a `Service` to handle all
-        // incoming HTTP requests on said connection.
-        let make_svc = make_service_fn(|_conn| {
-            // This is the `Service` that will handle the connection.
-            // `service_fn` is a helper to convert a function that
-            // returns a Response into a `Service`.
-            async { Ok::<_, hyper::Error>(service_fn(router)) }
-        });
-
-        let server = match Server::try_bind(&addr) {
-            Ok(server) => {
-                info!(message = "Listening on ", %addr);
-                server
-            }
-            Err(e) => {
-                error!(message = "Failed to bind port", err = ?e);
-                return;
-            }
-        };
-
-        match server.serve(make_svc).await {
-            Ok(_) => {
-                info!("Happy webserver ending");
-            }
-            Err(e) => {
-                error!(message = "Webserver failure", err = ?e);
-            }
-        }
-    }
-}
-
 mod mybus {
     use std::collections::HashMap;
-    use std::convert::From;
+
     use std::fmt;
     use std::sync::{Arc, Mutex};
 
@@ -564,81 +274,6 @@ mod mybus {
             }
         }
         Ok(result)
-    }
-
-    /// Get a list of all Bluetooth devices which have been discovered so far.
-    #[tracing::instrument(level = "info", skip_all)]
-    pub async fn find_devices<'device>(
-        connection: &zbus::Connection,
-    ) -> zbus::Result<Vec<Device1Proxy<'device>>> {
-        let bluez_root = zbus::fdo::ObjectManagerProxy::builder(connection)
-            .destination("org.bluez")?
-            .path("/")?
-            .build()
-            .await?;
-        let managed = bluez_root.get_managed_objects().await?;
-
-        // Filter down to only the pairs that match our interface
-        let object_paths: Vec<OwnedObjectPath> = managed
-            .into_iter()
-            .filter_map(|(object_path, mut children)| {
-                // Children is a hashmap<Interface, Data>
-                children
-                    .remove(Device1Proxy::INTERFACE)
-                    // data is HashMap<String,Value>
-                    .map(|data| (object_path, data))
-            })
-            .map(|(object_path, _)| object_path)
-            .collect();
-
-        let mut result: Vec<Device1Proxy> = Vec::new();
-        for object_path in object_paths {
-            let device = Device1Proxy::builder(connection)
-                .destination("org.bluez")?
-                .path(object_path)?
-                .cache_properties(zbus::CacheProperties::Yes)
-                .build()
-                .await?;
-            result.push(device);
-        }
-        // The above is cumbersomeely visiting all data since I wanted to debug it, and then throws
-        // it away in the last map.  That should be fine as we don't do this often, only at start.
-        Ok(result)
-    }
-
-    #[tracing::instrument(level = "info", skip_all)]
-    pub async fn device_lost(
-        mut removed: zbus::fdo::InterfacesRemovedStream<'_>,
-        pmap: DeviceHash<'static>,
-    ) {
-        while let Some(v) = removed.next().await {
-            if let Ok(data) = v.args() {
-                let object_path = OwnedObjectPath::from(data.object_path);
-                // Having the debug line below forces us to de-serialize the entire rest even when
-                // we don't care about it.
-                // debug!(message = "DBus Interface removed", data = ?data);
-
-                // Since the mutex guard cant be held across await, we take it in a closure and
-                // return the resulting one, before going in.
-                // That way we don't hold the mutex across thread jumps
-                let device = {
-                    let mut devices = match pmap.lock() {
-                        Ok(devices) => devices,
-                        Err(err) => {
-                            error!(message = "Failed to lock device table", err = ?err);
-                            // Returning from this function will make the application end.
-                            // Do that here.
-                            return;
-                        }
-                    };
-                    devices.remove(&object_path)
-                };
-                if let Some(device) = device {
-                    info!(message = "Device disconnected", device = %device);
-                    device.bye().await;
-                }
-            }
-        }
     }
 
     #[derive(Debug)]
@@ -733,61 +368,6 @@ mod mybus {
         }
     }
 
-    #[tracing::instrument(skip_all)]
-    pub async fn device_found(
-        mut added: zbus::fdo::InterfacesAddedStream<'_>,
-        pmap: DeviceHash<'static>,
-        connection: zbus::Connection,
-        tx: mpsc::Sender<SensorValues>,
-    ) {
-        // Data looks like this:
-        // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
-        while let Some(v) = added.next().await {
-            if let Ok(data) = v.args() {
-                // We force a new discovery if it's an adapter.
-                if data
-                    .interfaces_and_properties
-                    .iter()
-                    .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE)
-                {
-                    if let Err(err) = start_discovery(&connection).await {
-                        error!(message = "Failed to start discovery on new adapter",  err=?err, data=?data);
-                    }
-                }
-
-                let object_path = OwnedObjectPath::from(data.object_path);
-                if data
-                    .interfaces_and_properties
-                    .iter()
-                    .any(|(interface, _)| interface == &Device1Proxy::INTERFACE)
-                {
-                    // Clone the data so we can just toss it without caring about lifetimes.
-                    // The "biggest" is a string for the path.
-                    if let Ok(device) =
-                        MyDev::from_data(&connection, object_path.clone(), tx.clone()).await
-                    {
-                        let old = {
-                            let mut devices = match pmap.lock() {
-                                Ok(devices) => devices,
-                                Err(err) => {
-                                    error!(message = "Failed to unlock", err=?err);
-                                    return;
-                                    error!(message = "Failed to unlock", err=?err);
-                                    return;
-                                }
-                            };
-                            devices.insert(object_path, device)
-                        };
-                        if let Some(old) = old {
-                            info!(message = "Dropping old device for path", old = ?old);
-                            old.bye().await;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     #[tracing::instrument(skip_all, fields(name))]
     pub async fn adapter_start_discovery(adapter: &Adapter1Proxy<'_>) -> zbus::Result<()> {
         let name = adapter.name().await?;
@@ -839,87 +419,93 @@ mod mybus {
         }
     }
 }
-/*
-struct LostFound {
-    tx: mpsc::Sender<SensorValues>,
-}
+mod devices {
+    use std::collections::HashMap;
+    use std::convert::From;
 
-impl LostFound {
-    pub fn new(tx: mpsc::Sender<SensorValues>) -> Self {
-        // Mapping of  the device path => device
-        // Used so we can remove device proxies that are out of date.
-        LostFound {
-            tx,
-        }
+    use std::sync::{Arc, Mutex};
+
+    use ruuvi_sensor_protocol::SensorValues;
+    use tokio::sync::mpsc;
+    use tokio_stream::StreamExt;
+    use tracing::{error, info};
+    use zbus::zvariant::OwnedObjectPath;
+    use zbus::ProxyDefault; // Trait
+
+    use crate::bluez::adapter1::Adapter1Proxy;
+    use crate::bluez::device1::Device1Proxy;
+
+    use crate::mybus::start_discovery;
+    use crate::mybus::MyDev;
+    type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>;
+
+    #[derive(Debug)]
+    pub struct LostFound {
+        tx: mpsc::Sender<SensorValues>,
+        connection: zbus::Connection,
+        pmap: DeviceHash<'static>,
     }
 
-    // Spawn event-listeners for all currently visible devices.
-    pub async fn discover_devices(
-        &self,
-        connection: zbus::Connection,
-        pmap: Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>,
-    ) -> Result<(), Box<dyn Error>> {
-        for dev_proxy in find_devices(&connection).await? {
-            let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
-            let device = MyDev::new(dev_proxy, self.tx.clone()).await?;
+    impl LostFound {
+        pub fn new(tx: mpsc::Sender<SensorValues>, connection: zbus::Connection) -> LostFound {
+            // Mapping of  the device path => device
+            // Used so we can remove device proxies that are out of date.
+            let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, MyDev>::new()));
+            LostFound {
+                tx,
+                connection,
+                pmap,
+            }
+        }
 
-            match pmap.lock() {
-                Ok(mut devices) => {
-                    devices.insert(object_path, device);
-                }
-                Err(err) => {
-                    error!(message = "Failed to lock device table", err = ?err);
-                    // Should I do something more here? Nah.
+        #[tracing::instrument(level = "info", skip_all)]
+        pub async fn handle_removed_signal(&self, data: zbus::fdo::InterfacesRemovedArgs<'_>) {
+            let object_path = OwnedObjectPath::from(data.object_path);
+            // Having the debug line below forces us to de-serialize the entire rest even when
+            // we don't care about it.
+            // debug!(message = "DBus Interface removed", data = ?data);
+
+            // Since the mutex guard cant be held across await, we take it in a closure and
+            // return the resulting one, before going in.
+            // That way we don't hold the mutex across thread jumps
+            let device = {
+                let mut devices = self.pmap.lock().expect("Failed to lock devices");
+                devices.remove(&object_path)
+            };
+            if let Some(device) = device {
+                info!(message = "Device disconnected", device = %device);
+                device.bye().await;
+            }
+        }
+
+        #[tracing::instrument(level = "info")]
+        async fn insert_device(&self, object_path: OwnedObjectPath, device: MyDev<'static>) {
+            {
+                let old = {
+                    let mut devices = match self.pmap.lock() {
+                        Ok(devices) => devices,
+                        Err(err) => {
+                            // TODO: Figure out error handling
+                            error!(message = "Failed to unlock", err=?err);
+                            return;
+                        }
+                    };
+                    devices.insert(object_path, device)
+                };
+                if let Some(old) = old {
+                    info!(message = "Dropping old device for path", old = ?old);
+                    old.bye().await;
                 }
             }
         }
-        Ok(())
-    }
-    pub async fn handle_removed_signal(&self,
-        connection: zbus::Connection,
-        pmap: Arc<Mutex<HashMap<OwnedObjectPath, MyDev>>>,
-        data: zbus::fdo::InterfacesRemovedArgs<'_>) {
-        let object_path = OwnedObjectPath::from(data.object_path);
-        // Having the debug line below forces us to de-serialize the entire rest even when
-        // we don't care about it.
-        // debug!(message = "DBus Interface removed", data = ?data);
+        #[tracing::instrument(level = "info", skip_all)]
+        pub async fn handle_added_signal(&self, data: zbus::fdo::InterfacesAddedArgs<'_>) {
+            // Data looks like this:
+            // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
 
-        // Since the mutex guard cant be held across await, we take it in a closure and
-        // return the resulting one, before going in.
-        // That way we don't hold the mutex across thread jumps
-        let pmap = pmap.clone();
-        {
-            if let Ok(mut devices) = pmap.lock() {
-                if let Some(device) = devices.remove(&object_path) {
-                    async move {
-                        info!(message = "Device disconnected", device = %device);
-                        device.bye().await;
-                    }
-                }
-            }
-        }
-    }
-    async fn add_device(&mut self,
-
-        connection: zbus::Connection,
-        pmap: Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>,
-                        object_path: OwnedObjectPath, device: MyDev<'_>) {
-        if let Ok(devices) = pmap.lock() {
-            let Some(old) = devices.insert(object_path, device) {
-                info!(message = "Dropping old device for path", old = ?old);
-                old.bye().await;
-            }
-        }
-    }
-    pub async fn handle_added_signal(&self,
-        connection: zbus::Connection,
-        pmap: Arc<Mutex<HashMap<OwnedObjectPath, MyDev>>>,
-                                     data: zbus::fdo::InterfacesAddedArgs<'_>) -> Result<(), zbus::Error> {
-        use crate::bluez::device1::Device1Proxy;
-        use crate::bluez::adapter1::Adapter1Proxy;
-        use zbus::ProxyDefault; // Trait
-        // Data looks like this:
-        // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
+            // Clone connection to avoid lifetime issues
+            let connection = self.connection.clone();
+            let tx = self.tx.clone();
             // We force a new discovery if it's an adapter.
             if data
                 .interfaces_and_properties
@@ -930,7 +516,6 @@ impl LostFound {
                     error!(message = "Failed to start discovery on new adapter",  err=?err, data=?data);
                 }
             }
-
             let object_path = OwnedObjectPath::from(data.object_path);
             if data
                 .interfaces_and_properties
@@ -939,73 +524,111 @@ impl LostFound {
             {
                 // Clone the data so we can just toss it without caring about lifetimes.
                 // The "biggest" is a string for the path.
-                if let Ok(device) = MyDev::from_data(&connection, object_path.clone(), self.tx.clone()).await
+                if let Ok(device) =
+                    MyDev::from_data(&connection, object_path.clone(), tx.clone()).await
                 {
-                    if let Ok(mut devices) = pmap.clone().lock() {
-                        if let Some(old) = devices.insert(object_path, device) {
-                            info!(message = "Dropping old device for path", old = ?old);
-                            old.bye().await;
-                        }
-                    }
+                    self.insert_device(object_path, device).await;
                 }
+            }
+        }
+
+        pub async fn initial_subscription(&self) -> Result<(), Box<dyn std::error::Error>> {
+            let connection = self.connection.clone();
+
+            for dev_proxy in find_devices(&connection).await? {
+                let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
+                let device = MyDev::new(dev_proxy, self.tx.clone()).await?;
+                self.insert_device(object_path, device).await;
             }
             Ok(())
         }
-}
+    }
+    /// Get a list of all Bluetooth devices which have been discovered so far.
+    #[tracing::instrument(level = "info", skip_all)]
+    pub async fn find_devices<'device>(
+        connection: &zbus::Connection,
+    ) -> zbus::Result<Vec<Device1Proxy<'device>>> {
+        let bluez_root = zbus::fdo::ObjectManagerProxy::builder(connection)
+            .destination("org.bluez")?
+            .path("/")?
+            .build()
+            .await?;
+        let managed = bluez_root.get_managed_objects().await?;
 
-*/
-/*
-pub async fn run_lostfound_actor(actor: LostFound) {
-    // Lets try to get some changes on the devices
-    let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&actor.connection)
-        .destination("org.bluez").unwrap()
-        .path("/").unwrap()
-        .build()
-        .await.unwrap();
-    let mut removed = bluez_root.receive_interfaces_removed().await.unwrap();
-    let mut added = bluez_root.receive_interfaces_added().await.unwrap();
-    loop {
-        tokio::select! {
-            Some(rem_sig) = removed.next() => {
-                if let Ok(data) = rem_sig.args() {
-                    actor.handle_removed_signal(data).await
-                }
-            },
-            Some(add_sig) = added.next() => {
-                if let Ok(data) = add_sig.args() {
-                    actor.handle_added_signal(data).await.unwrap()
-                }
-            },
-            else => break,
+        // Filter down to only the pairs that match our interface
+        let object_paths: Vec<OwnedObjectPath> = managed
+            .into_iter()
+            .filter_map(|(object_path, mut children)| {
+                // Children is a hashmap<Interface, Data>
+                children
+                    .remove(Device1Proxy::INTERFACE)
+                    // data is HashMap<String,Value>
+                    .map(|data| (object_path, data))
+            })
+            .map(|(object_path, _)| object_path)
+            .collect();
+
+        let mut result: Vec<Device1Proxy> = Vec::new();
+        for object_path in object_paths {
+            let device = Device1Proxy::builder(connection)
+                .destination("org.bluez")?
+                .path(object_path)?
+                .cache_properties(zbus::CacheProperties::Yes)
+                .build()
+                .await?;
+            result.push(device);
+        }
+        // The above is cumbersomeely visiting all data since I wanted to debug it, and then throws
+        // it away in the last map.  That should be fine as we don't do this often, only at start.
+        Ok(result)
+    }
+
+    pub async fn run_lostfound_actor(actor: LostFound) {
+        // Lets try to get some changes on the devices
+        let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&actor.connection)
+            .destination("org.bluez")
+            .unwrap()
+            .path("/")
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut removed = bluez_root.receive_interfaces_removed().await.unwrap();
+        let mut added = bluez_root.receive_interfaces_added().await.unwrap();
+        // Only iterate and subscribe _after_ we have set up the listeners, or we may (maybe) miss
+        // a device that appeared in this tiny race window.
+        actor
+            .initial_subscription()
+            .await
+            .expect("Failed to subscribe to devices");
+
+        loop {
+            tokio::select! {
+                Some(rem_sig) = removed.next() => {
+                    if let Ok(data) = rem_sig.args() {
+                        actor.handle_removed_signal(data).await
+                    }
+                },
+                Some(add_sig) = added.next() => {
+                    if let Ok(data) = add_sig.args() {
+                        actor.handle_added_signal(data).await
+                    }
+                },
+                else => break,
+            }
         }
     }
 }
-*/
-use mybus::device_found;
-use mybus::device_lost;
 
 async fn real_main() -> Result<(), Box<dyn Error>> {
     let mut connection = zbus::Connection::system().await?;
     connection.set_max_queued(1200);
-
-    // Mapping of  the device path => device
-    // Used so we can remove device proxies that are out of date.
-    let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, MyDev>::new()));
 
     let (tx, rx) = mpsc::channel(100);
     let (tx2, rx2) = mpsc::channel(100);
     let (tx3, _rx3) = mpsc::channel(100);
 
     info!(message = "Setting up interface add and remove signals");
-    // Lets try to get some changes on the devices
-    let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&connection)
-        .destination("org.bluez")?
-        .path("/")?
-        .build()
-        .await?;
-
-    let added = bluez_root.receive_interfaces_added().await?;
-    let removed = bluez_root.receive_interfaces_removed().await?;
 
     let address: SocketAddr = "0.0.0.0:9185".parse()?;
 
@@ -1019,34 +642,15 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 
     let prom_actor = prom::SensorActor::new(rx, tx2);
     let modio_actor = modio::SensorActor::new(rx2, tx3, modio_connection);
+    let lostfound_actor = devices::LostFound::new(tx.clone(), connection.clone());
     let tasks = [
-        tokio::spawn(device_lost(removed, pmap.clone())),
-        tokio::spawn(device_found(
-            added,
-            pmap.clone(),
-            connection.clone(),
-            tx.clone(),
-        )),
         // Web server
         tokio::spawn(serve::webserver(address)),
         // Sensor data processor
         tokio::spawn(prom::run_sensor_actor(prom_actor)),
         tokio::spawn(modio::run_sensor_actor(modio_actor)),
+        tokio::spawn(devices::run_lostfound_actor(lostfound_actor)),
     ];
-    for dev_proxy in find_devices(&connection).await? {
-        let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
-        let device = MyDev::new(dev_proxy, tx.clone()).await?;
-
-        match pmap.lock() {
-            Ok(mut devices) => {
-                devices.insert(object_path, device);
-            }
-            Err(err) => {
-                error!(message = "Failed to lock device table", err = ?err);
-                // Should I do something more here? Nah.
-            }
-        }
-    }
 
     if let Err(err) = start_discovery(&connection).await {
         error!(message = "Failed to start discovery. Airplane mode?", err = %err);
