@@ -386,7 +386,7 @@ mod mybus {
             object_path: OwnedObjectPath,
             tx: mpsc::Sender<SensorValues>,
         ) -> zbus::Result<MyDev<'static>> {
-            let dev_proxy = Device1Proxy::builder(&connection)
+            let dev_proxy = Device1Proxy::builder(connection)
                 .destination("org.bluez")?
                 .path(object_path)?
                 .cache_properties(zbus::CacheProperties::Yes)
