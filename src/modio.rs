@@ -1,7 +1,7 @@
 use crate::data::DecodedSensor;
 use ruuvi_sensor_protocol::SensorValues;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{debug, info};
 
 pub struct SensorActor {
     receiver: mpsc::Receiver<SensorValues>,
@@ -55,7 +55,7 @@ async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) 
     let decoder = DecodedSensor::new(sensor);
     if let Some(mac) = decoder.mac() {
         for (name, val, unit) in decoder {
-            info!(value = val, name = name, unit = unit, "have a decoded v");
+            debug!(value = val, name = name, unit = unit, "Decoded value");
             let key = format!("ruuvi.{mac}.{name}");
             ipc.store(&key, &val).await.unwrap();
         }
