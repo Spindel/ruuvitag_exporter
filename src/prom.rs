@@ -133,6 +133,7 @@ impl SensorActor {
     }
 }
 pub async fn run_sensor_actor(mut actor: SensorActor) {
+    info!("Logging data to prometheus");
     while let Some(msg) = actor.receiver.recv().await {
         actor
             .handle_message(msg)

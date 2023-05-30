@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
+
+#[cfg(feature = "prometheus")]
 use std::net::SocketAddr;
 
 use futures::stream::FuturesUnordered;
@@ -15,7 +17,10 @@ use mybus::start_discovery;
 
 mod addr;
 mod bluez;
+
+#[cfg(feature = "prometheus")]
 mod prom;
+#[cfg(feature = "prometheus")]
 mod serve;
 
 fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> {
@@ -27,51 +32,59 @@ fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> 
     None
 }
 
-mod modio {
+mod data {
     use crate::addr;
 
     use ruuvi_sensor_protocol::SensorValues;
     use tokio::sync::mpsc;
     use tracing::info;
 
-    pub struct SensorActor {
+    // Traits
+    use ruuvi_sensor_protocol::{
+        Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
+        Temperature, TransmitterPower,
+    };
+    pub struct LogActor {
         receiver: mpsc::Receiver<SensorValues>,
-        sender: mpsc::Sender<SensorValues>,
-        connection: zbus::Connection,
     }
-    impl SensorActor {
-        pub fn new(
-            receiver: mpsc::Receiver<SensorValues>,
-            sender: mpsc::Sender<SensorValues>,
-            connection: zbus::Connection,
-        ) -> Self {
-            SensorActor {
-                receiver,
-                sender,
-                connection,
+    impl LogActor {
+        pub async fn new(receiver: mpsc::Receiver<SensorValues>) -> Self {
+            LogActor { receiver }
+        }
+
+        pub async fn handle_message(&mut self, msg: SensorValues) {
+            log_sensor(&msg).await;
+        }
+    }
+
+    #[tracing::instrument]
+    async fn log_sensor(sensor: &SensorValues) {
+        let decoder = DecodedSensor::new(sensor);
+        if let Some(mac) = decoder.mac() {
+            for (name, val, unit) in decoder {
+                info!(
+                    value = val,
+                    name = name,
+                    unit = unit,
+                    mac = mac,
+                    "Decoded value"
+                );
             }
         }
-
-        pub async fn handle_message(
-            &mut self,
-            msg: SensorValues,
-        ) -> Result<(), tokio::sync::mpsc::error::SendError<SensorValues>> {
-            modio_log_sensor(&self.connection, &msg).await;
-            self.sender.send(msg).await
-        }
     }
 
-    pub async fn run_sensor_actor(mut actor: SensorActor) {
+    pub async fn run_logger_actor(mut actor: LogActor) {
+        info!("Prepared to print parsed data to log");
         while let Some(msg) = actor.receiver.recv().await {
-            actor
-                .handle_message(msg)
-                .await
-                .expect("Unknown failure in channel");
+            actor.handle_message(msg).await
         }
     }
 
     #[derive(Debug)]
     struct DecodeError;
+
+    // Enum for the state of the decoder. Is used as a state machine, as well as to track the
+    // meaning of value and their units.
     #[derive(PartialEq)]
     enum DecidedSensorState {
         Humidity,
@@ -102,6 +115,9 @@ mod modio {
                 Done => "__done",
             }
         }
+
+        // Tracking the unit here vs. in the decoder is a bit ugly, and requires them to be kept
+        // in sync.
         pub fn senml_str(&self) -> &str {
             use DecidedSensorState::*;
             match self {
@@ -119,25 +135,20 @@ mod modio {
         }
     }
 
-    struct DecodedSensor<'sensor> {
+    pub struct DecodedSensor<'sensor> {
         state: DecidedSensorState,
         sensor: &'sensor SensorValues,
     }
-    // Traits
-    use ruuvi_sensor_protocol::{
-        Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
-        Temperature, TransmitterPower,
-    };
 
     impl DecodedSensor<'_> {
-        fn new<'sensor>(sensor: &'sensor SensorValues) -> DecodedSensor<'sensor> {
+        pub fn new(sensor: &SensorValues) -> DecodedSensor<'_> {
             DecodedSensor {
-                sensor: sensor,
+                sensor,
                 state: DecidedSensorState::Humidity,
             }
         }
 
-        fn mac(&self) -> Option<String> {
+        pub fn mac(&self) -> Option<String> {
             self.sensor
                 .mac_address()
                 .map(addr::Address::from)
@@ -211,14 +222,66 @@ mod modio {
             val.map(|val| (step, val.to_string(), unit))
         }
     }
+}
+
+#[cfg(feature = "modio")]
+mod modio {
+    use ruuvi_sensor_protocol::SensorValues;
+    use tokio::sync::mpsc;
+    use tracing::info;
+
+    pub struct SensorActor {
+        receiver: mpsc::Receiver<SensorValues>,
+        sender: mpsc::Sender<SensorValues>,
+        connection: zbus::Connection,
+    }
+    impl SensorActor {
+        pub async fn new(
+            receiver: mpsc::Receiver<SensorValues>,
+            sender: mpsc::Sender<SensorValues>,
+        ) -> Self {
+            // modio connection stuff
+            let session = std::env::args().any(|arg| arg == "--session");
+            let connection = if session {
+                zbus::Connection::session().await.unwrap()
+            } else {
+                zbus::Connection::system().await.unwrap()
+            };
+            SensorActor {
+                receiver,
+                sender,
+                connection,
+            }
+        }
+
+        pub async fn handle_message(
+            &mut self,
+            msg: SensorValues,
+        ) -> Result<(), tokio::sync::mpsc::error::SendError<SensorValues>> {
+            modio_log_sensor(&self.connection, &msg).await;
+            self.sender.send(msg).await
+        }
+    }
+
+    pub async fn run_sensor_actor(mut actor: SensorActor) {
+        info!("Prepared to store data to modio-logger");
+        while let Some(msg) = actor.receiver.recv().await {
+            actor
+                .handle_message(msg)
+                .await
+                .expect("Unknown failure in channel");
+        }
+    }
+
+    use crate::data::DecodedSensor;
 
     #[tracing::instrument]
     async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) {
-        let ipc = fsipc::legacy::fsipcProxy::builder(&connection)
+        let ipc = fsipc::legacy::fsipcProxy::builder(connection)
             .build()
             .await
             .unwrap();
-        let decoder = DecodedSensor::new(&sensor);
+        let decoder = DecodedSensor::new(sensor);
         if let Some(mac) = decoder.mac() {
             for (name, val, unit) in decoder {
                 info!(value = val, name = name, unit = unit, "have a decoded v");
@@ -233,7 +296,6 @@ mod mybus {
     use std::collections::HashMap;
 
     use std::fmt;
-    use std::sync::{Arc, Mutex};
 
     use ruuvi_sensor_protocol::SensorValues;
     use tokio::sync::mpsc;
@@ -245,7 +307,6 @@ mod mybus {
     use crate::bluez::adapter1::Adapter1Proxy;
     use crate::bluez::device1::Device1Proxy;
     use crate::from_manuf;
-    type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>;
 
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
@@ -469,7 +530,13 @@ mod devices {
             // return the resulting one, before going in.
             // That way we don't hold the mutex across thread jumps
             let device = {
-                let mut devices = self.pmap.lock().expect("Failed to lock devices");
+                let mut devices = match self.pmap.lock() {
+                    Ok(devices) => devices,
+                    Err(err) => {
+                        error!(err = ? err, message = "Failed to unlock removed device due to poison");
+                        return;
+                    }
+                };
                 devices.remove(&object_path)
             };
             if let Some(device) = device {
@@ -479,14 +546,13 @@ mod devices {
         }
 
         #[tracing::instrument(level = "info")]
-        async fn insert_device(&self, object_path: OwnedObjectPath, device: MyDev<'static>) {
+        async fn store_device(&self, object_path: OwnedObjectPath, device: MyDev<'static>) {
             {
                 let old = {
                     let mut devices = match self.pmap.lock() {
                         Ok(devices) => devices,
                         Err(err) => {
-                            // TODO: Figure out error handling
-                            error!(message = "Failed to unlock", err=?err);
+                            error!(err = ? err, message = "Failed to unlock due to poison");
                             return;
                         }
                     };
@@ -527,18 +593,19 @@ mod devices {
                 if let Ok(device) =
                     MyDev::from_data(&connection, object_path.clone(), tx.clone()).await
                 {
-                    self.insert_device(object_path, device).await;
+                    self.store_device(object_path, device).await;
                 }
             }
         }
 
+        #[tracing::instrument(level = "info", skip_all)]
         pub async fn initial_subscription(&self) -> Result<(), Box<dyn std::error::Error>> {
             let connection = self.connection.clone();
-
+            info!(message = "Subscribing to pre-existing devices");
             for dev_proxy in find_devices(&connection).await? {
                 let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
                 let device = MyDev::new(dev_proxy, self.tx.clone()).await?;
-                self.insert_device(object_path, device).await;
+                self.store_device(object_path, device).await;
             }
             Ok(())
         }
@@ -602,6 +669,7 @@ mod devices {
             .await
             .expect("Failed to subscribe to devices");
 
+        info!("Tracking bluetooth device appearance and disappearance");
         loop {
             tokio::select! {
                 Some(rem_sig) = removed.next() => {
@@ -624,33 +692,53 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     let mut connection = zbus::Connection::system().await?;
     connection.set_max_queued(1200);
 
-    let (tx, rx) = mpsc::channel(100);
-    let (tx2, rx2) = mpsc::channel(100);
-    let (tx3, _rx3) = mpsc::channel(100);
+    let (new_devices_tx, rx) = mpsc::channel(100);
+
+    let lostfound_actor = devices::LostFound::new(new_devices_tx, connection.clone());
 
     info!(message = "Setting up interface add and remove signals");
 
-    let address: SocketAddr = "0.0.0.0:9185".parse()?;
-
-    // modio connection stuff
-    let session = std::env::args().any(|arg| arg == "--session");
-    let modio_connection = if session {
-        zbus::Connection::session().await.unwrap()
-    } else {
-        zbus::Connection::system().await.unwrap()
-    };
-
-    let prom_actor = prom::SensorActor::new(rx, tx2);
-    let modio_actor = modio::SensorActor::new(rx2, tx3, modio_connection);
-    let lostfound_actor = devices::LostFound::new(tx.clone(), connection.clone());
-    let tasks = [
-        // Web server
-        tokio::spawn(serve::webserver(address)),
+    let mut tasks = vec![
         // Sensor data processor
-        tokio::spawn(prom::run_sensor_actor(prom_actor)),
-        tokio::spawn(modio::run_sensor_actor(modio_actor)),
         tokio::spawn(devices::run_lostfound_actor(lostfound_actor)),
     ];
+
+    // If we enable the feature, we add another pair of channels, passing the receiver of the
+    // previous to this, and the new TX into it, so messages are worked on and passed on.
+    #[cfg(feature = "modio")]
+    let rx = if cfg!(feature = "modio") {
+        let (modio_tx, modio_rx) = mpsc::channel(100);
+        let modio_actor = modio::SensorActor::new(rx, modio_tx).await;
+        tasks.push(tokio::spawn(modio::run_sensor_actor(modio_actor)));
+        modio_rx
+    } else {
+        rx
+    };
+
+    // If prometheus is enabled, we also run the web-server
+    // Otherwise, we do not...
+
+    #[cfg(feature = "prometheus")]
+    if cfg!(feature = "prometheus") {
+        // Web server
+        let address: SocketAddr = "0.0.0.0:9185".parse()?;
+        tasks.push(tokio::spawn(serve::webserver(address)));
+    };
+
+    #[cfg(feature = "prometheus")]
+    let rx = if cfg!(feature = "prometheus") {
+        let (prom_tx, prom_rx) = mpsc::channel(100);
+        let prom_actor = prom::SensorActor::new(rx, prom_tx);
+        tasks.push(tokio::spawn(prom::run_sensor_actor(prom_actor)));
+        prom_rx
+    } else {
+        rx
+    };
+
+    // the LogActor acts as a drain, being the last on a chain of channels between
+    // modio/prometheus/other channels
+    let log_actor = data::LogActor::new(rx).await;
+    tasks.push(tokio::spawn(data::run_logger_actor(log_actor)));
 
     if let Err(err) = start_discovery(&connection).await {
         error!(message = "Failed to start discovery. Airplane mode?", err = %err);
