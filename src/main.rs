@@ -18,6 +18,8 @@ use mybus::start_discovery;
 mod addr;
 mod bluez;
 
+#[cfg(feature = "modio")]
+mod modio;
 #[cfg(feature = "prometheus")]
 mod prom;
 #[cfg(feature = "prometheus")]
@@ -220,74 +222,6 @@ mod data {
                 DecidedSensorState::Done => DecidedSensorState::Done,
             };
             val.map(|val| (step, val.to_string(), unit))
-        }
-    }
-}
-
-#[cfg(feature = "modio")]
-mod modio {
-    use ruuvi_sensor_protocol::SensorValues;
-    use tokio::sync::mpsc;
-    use tracing::info;
-
-    pub struct SensorActor {
-        receiver: mpsc::Receiver<SensorValues>,
-        sender: mpsc::Sender<SensorValues>,
-        connection: zbus::Connection,
-    }
-    impl SensorActor {
-        pub async fn new(
-            receiver: mpsc::Receiver<SensorValues>,
-            sender: mpsc::Sender<SensorValues>,
-        ) -> Self {
-            // modio connection stuff
-            let session = std::env::args().any(|arg| arg == "--session");
-            let connection = if session {
-                zbus::Connection::session().await.unwrap()
-            } else {
-                zbus::Connection::system().await.unwrap()
-            };
-            SensorActor {
-                receiver,
-                sender,
-                connection,
-            }
-        }
-
-        pub async fn handle_message(
-            &mut self,
-            msg: SensorValues,
-        ) -> Result<(), tokio::sync::mpsc::error::SendError<SensorValues>> {
-            modio_log_sensor(&self.connection, &msg).await;
-            self.sender.send(msg).await
-        }
-    }
-
-    pub async fn run_sensor_actor(mut actor: SensorActor) {
-        info!("Prepared to store data to modio-logger");
-        while let Some(msg) = actor.receiver.recv().await {
-            actor
-                .handle_message(msg)
-                .await
-                .expect("Unknown failure in channel");
-        }
-    }
-
-    use crate::data::DecodedSensor;
-
-    #[tracing::instrument]
-    async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) {
-        let ipc = fsipc::legacy::fsipcProxy::builder(connection)
-            .build()
-            .await
-            .unwrap();
-        let decoder = DecodedSensor::new(sensor);
-        if let Some(mac) = decoder.mac() {
-            for (name, val, unit) in decoder {
-                info!(value = val, name = name, unit = unit, "have a decoded v");
-                let key = format!("ruuvi.{mac}.{name}");
-                ipc.store(&key, &val).await.unwrap();
-            }
         }
     }
 }
