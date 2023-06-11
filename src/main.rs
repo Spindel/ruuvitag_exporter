@@ -59,7 +59,7 @@ mod data {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn log_sensor(sensor: &SensorValues) {
         let decoder = DecodedSensor::new(sensor);
         if let Some(mac) = decoder.mac() {

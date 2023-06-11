@@ -46,7 +46,7 @@ pub async fn run_sensor_actor(mut actor: SensorActor) {
     }
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip_all)]
 async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) {
     let ipc = fsipc::legacy::fsipcProxy::builder(connection)
         .build()
