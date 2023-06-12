@@ -6,7 +6,7 @@ use prometheus::{
 };
 use ruuvi_sensor_protocol::SensorValues;
 use tokio::sync::mpsc;
-use tracing::{error, field, info, span, warn, Level};
+use tracing::{field, info, span, warn, Level};
 
 lazy_static! {
     static ref TEMPERATURE: GaugeVec =
@@ -135,38 +135,8 @@ impl SensorActor {
 pub async fn run_sensor_actor(mut actor: SensorActor) -> anyhow::Result<()> {
     info!("Logging data to prometheus");
     while let Some(msg) = actor.receiver.recv().await {
-        actor.handle_message(msg).await?
+        actor.handle_message(msg).await?;
     }
     let err = anyhow::Error::msg("No more sensor values");
     Err(err)
-}
-
-#[tracing::instrument(level = "trace", skip_all)]
-pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-    // Shouldn't this be easier?
-    // The flow here looks really convoluted in my opinion.
-    loop {
-        // If no data arrives within TIMEOUT,  abort the wait.
-        match tokio::time::timeout(TIMEOUT, rx.recv()).await {
-            Err(_) => {
-                // Timeout happened.
-                // Log the error and the timeout, then return from this task.
-                error!(message = "No new values", timeout = TIMEOUT.as_secs());
-                return;
-            }
-            Ok(rxval) => match rxval {
-                // some data arrived. All is good
-                Some(_sensor) => {
-                    // register_sensor(&sensor);
-                    // modio_log_sensor(true, &sensor).await;
-                }
-                // None happens when there are no senders left.
-                None => {
-                    warn!("No data-emitter tasks left.");
-                    return;
-                }
-            },
-        }
-    }
 }

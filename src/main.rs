@@ -116,7 +116,10 @@ mod data {
 
     impl DecidedSensorState {
         pub fn as_str(&self) -> &str {
-            use DecidedSensorState::{AccelX, AccelY, AccelZ, Done, Humidity, Movement, Pressure, Temperature, Txpow, Volts};
+            use DecidedSensorState::{
+                AccelX, AccelY, AccelZ, Done, Humidity, Movement, Pressure, Temperature, Txpow,
+                Volts,
+            };
             match self {
                 Humidity => "humidity",
                 Pressure => "pressure",
@@ -134,7 +137,10 @@ mod data {
         // Tracking the unit here vs. in the decoder is a bit ugly, and requires them to be kept
         // in sync.
         pub fn senml_str(&self) -> &str {
-            use DecidedSensorState::{AccelX, AccelY, AccelZ, Done, Humidity, Movement, Pressure, Temperature, Txpow, Volts};
+            use DecidedSensorState::{
+                AccelX, AccelY, AccelZ, Done, Humidity, Movement, Pressure, Temperature, Txpow,
+                Volts,
+            };
             match self {
                 Humidity => "/",
                 Pressure => "Pa",
@@ -142,9 +148,7 @@ mod data {
                 Volts => "V",
                 Txpow => "dBm",
                 Movement => "count",
-                AccelX => "g",
-                AccelY => "g",
-                AccelZ => "g",
+                AccelX | AccelY | AccelZ => "g",
                 Done => "",
             }
         }
@@ -231,8 +235,7 @@ mod data {
                 DecidedSensorState::Movement => DecidedSensorState::AccelX,
                 DecidedSensorState::AccelX => DecidedSensorState::AccelY,
                 DecidedSensorState::AccelY => DecidedSensorState::AccelZ,
-                DecidedSensorState::AccelZ => DecidedSensorState::Done,
-                DecidedSensorState::Done => DecidedSensorState::Done,
+                DecidedSensorState::AccelZ | DecidedSensorState::Done => DecidedSensorState::Done,
             };
             val.map(|val| (step, val.to_string(), unit))
         }
@@ -445,7 +448,7 @@ mod mybus {
     ) -> anyhow::Result<()> {
         while let Some(v) = stream.next().await {
             if let Some(decoded) = manufacturer_data_one(v).await? {
-                tx.send(decoded).await?
+                tx.send(decoded).await?;
             }
         }
         Ok(())
@@ -675,12 +678,12 @@ mod devices {
             tokio::select! {
                 Some(rem_sig) = removed.next() => {
                     if let Ok(data) = rem_sig.args() {
-                        actor.handle_removed_signal(data).await?
+                        actor.handle_removed_signal(data).await?;
                     }
                 },
                 Some(add_sig) = added.next() => {
                     if let Ok(data) = add_sig.args() {
-                        actor.handle_added_signal(data).await?
+                        actor.handle_added_signal(data).await?;
                     }
                 },
                 else => break,
@@ -819,5 +822,5 @@ async fn real_main() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    real_main().await
+    Box::pin(real_main()).await
 }
