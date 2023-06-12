@@ -49,22 +49,9 @@ mod data {
         Temperature, TransmitterPower,
     };
 
-    pub struct LogActor {
-        receiver: mpsc::Receiver<SensorValues>,
-    }
-    impl LogActor {
-        pub async fn new(receiver: mpsc::Receiver<SensorValues>) -> Self {
-            LogActor { receiver }
-        }
-
-        pub async fn handle_message(&mut self, msg: SensorValues) {
-            log_sensor(&msg).await;
-        }
-    }
-
     #[tracing::instrument(level = "debug")]
-    async fn log_sensor(sensor: &SensorValues) {
-        let decoder = DecodedSensor::new(sensor);
+    pub fn log_sensor(sensor: SensorValues) {
+        let decoder = DecodedSensor::new(&sensor);
         if let Some(mac) = decoder.mac() {
             for (name, val, unit) in decoder {
                 info!(
@@ -78,7 +65,10 @@ mod data {
         }
     }
 
-    pub async fn run_drain_channel(mut rx: mpsc::Receiver<SensorValues>) -> anyhow::Result<()> {
+    pub async fn run_drain_channel(
+        mut rx: mpsc::Receiver<SensorValues>,
+        callback: fn(SensorValues) -> (),
+    ) -> anyhow::Result<()> {
         use tokio::time::timeout;
         let mut count = 0;
         let delay = std::time::Duration::from_secs(120);
@@ -86,8 +76,9 @@ mod data {
         info!("Prepared to discard remaining data");
         loop {
             if let Ok(val) = timeout(delay, rx.recv()).await {
-                if val.is_some() {
+                if let Some(sensor) = val {
                     count += 1;
+                    callback(sensor);
                 } else {
                     tracing::warn!(
                         discarded_messages = count,
@@ -98,26 +89,6 @@ mod data {
                 }
             } else {
                 tracing::warn!(discarded_messages = count, period = ?delay, "No more data from the bus.");
-                let err = anyhow::Error::msg("Timeout waiting for new data.");
-                return Err(err);
-            }
-        }
-    }
-
-    pub async fn run_logger_actor(mut actor: LogActor) -> anyhow::Result<()> {
-        info!("Prepared to print parsed data to log");
-        use tokio::time::timeout;
-        let delay = std::time::Duration::from_secs(120);
-        loop {
-            if let Ok(val) = timeout(delay, actor.receiver.recv()).await {
-                if let Some(msg) = val {
-                    actor.handle_message(msg).await
-                } else {
-                    let err = anyhow::Error::msg("Upstream metadata collector hung up");
-                    return Err(err);
-                }
-            } else {
-                tracing::warn!(period = ?delay, "No data during period.");
                 let err = anyhow::Error::msg("Timeout waiting for new data.");
                 return Err(err);
             }
@@ -768,15 +739,14 @@ async fn real_main() -> anyhow::Result<()> {
         rx
     };
 
+    // Last in the chain we drain values and discard them.
     if cfg!(feature = "modio") || cfg!(feature = "prometheus") {
         // Drain the pipe at the end, leaving only silence.
-        tasks.push(tokio::spawn(data::run_drain_channel(rx)));
+        tasks.push(tokio::spawn(data::run_drain_channel(rx, |_| {})));
     }
-    // the LogActor acts as a drain, being the last on a chain of channels between
-    // modio/prometheus/other channels
+    // But if we have neither modio nor prometheus sinks, we log them as we drain.
     else {
-        let log_actor = data::LogActor::new(rx).await;
-        tasks.push(tokio::spawn(data::run_logger_actor(log_actor)));
+        tasks.push(tokio::spawn(data::run_drain_channel(rx, data::log_sensor)));
     }
 
     start_discovery(&connection)
