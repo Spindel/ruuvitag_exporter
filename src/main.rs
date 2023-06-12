@@ -1,5 +1,5 @@
+use anyhow::Context;
 use std::collections::HashMap;
-use std::error::Error;
 
 #[cfg(feature = "prometheus")]
 use std::net::SocketAddr;
@@ -78,10 +78,49 @@ mod data {
         }
     }
 
-    pub async fn run_logger_actor(mut actor: LogActor) {
+    pub async fn run_drain_channel(mut rx: mpsc::Receiver<SensorValues>) -> anyhow::Result<()> {
+        use tokio::time::timeout;
+        let mut count = 0;
+        let delay = std::time::Duration::from_secs(120);
+
+        info!("Prepared to discard remaining data");
+        loop {
+            if let Ok(val) = timeout(delay, rx.recv()).await {
+                if val.is_some() {
+                    count += 1;
+                } else {
+                    tracing::warn!(
+                        discarded_messages = count,
+                        "Upstream metadata collector hung up"
+                    );
+                    let err = anyhow::Error::msg("Upstream metadata collector hung up");
+                    return Err(err);
+                }
+            } else {
+                tracing::warn!(discarded_messages = count, period = ?delay, "No more data from the bus.");
+                let err = anyhow::Error::msg("Timeout waiting for new data.");
+                return Err(err);
+            }
+        }
+    }
+
+    pub async fn run_logger_actor(mut actor: LogActor) -> anyhow::Result<()> {
         info!("Prepared to print parsed data to log");
-        while let Some(msg) = actor.receiver.recv().await {
-            actor.handle_message(msg).await
+        use tokio::time::timeout;
+        let delay = std::time::Duration::from_secs(120);
+        loop {
+            if let Ok(val) = timeout(delay, actor.receiver.recv()).await {
+                if let Some(msg) = val {
+                    actor.handle_message(msg).await
+                } else {
+                    let err = anyhow::Error::msg("Upstream metadata collector hung up");
+                    return Err(err);
+                }
+            } else {
+                tracing::warn!(period = ?delay, "No data during period.");
+                let err = anyhow::Error::msg("Timeout waiting for new data.");
+                return Err(err);
+            }
         }
     }
 
@@ -237,7 +276,7 @@ mod mybus {
     use ruuvi_sensor_protocol::SensorValues;
     use tokio::sync::mpsc;
     use tokio_stream::StreamExt;
-    use tracing::{debug, error, info, trace, warn};
+    use tracing::{debug, info, trace, warn};
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
 
@@ -246,7 +285,9 @@ mod mybus {
     use crate::from_manuf;
 
     #[tracing::instrument(level = "info", skip_all)]
-    pub async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
+    pub async fn find_adapters(
+        connection: &zbus::Connection,
+    ) -> anyhow::Result<Vec<Adapter1Proxy>> {
         let mut result: Vec<Adapter1Proxy> = Vec::new();
 
         let p = zbus::fdo::ObjectManagerProxy::builder(connection)
@@ -277,7 +318,7 @@ mod mybus {
     #[derive(Debug)]
     pub struct MyDev<'device> {
         device: Device1Proxy<'device>,
-        listener: tokio::task::JoinHandle<()>,
+        listener: tokio::task::JoinHandle<anyhow::Result<()>>,
         name: Option<String>,
         address: Option<String>,
     }
@@ -286,7 +327,8 @@ mod mybus {
         pub async fn new(
             device: Device1Proxy<'static>,
             tx: mpsc::Sender<SensorValues>,
-        ) -> zbus::Result<MyDev<'static>> {
+        ) -> anyhow::Result<MyDev<'static>> {
+            use anyhow::Context;
             let address = device.address().await.ok();
             let name = device.name().await.ok();
             if name.is_some() {
@@ -299,12 +341,11 @@ mod mybus {
             debug!(message = "Gathering manufacturer data");
             if let Ok(manuf_data) = device.manufacturer_data().await {
                 if let Some(sens) = from_manuf(manuf_data) {
-                    if let Err(err) = tx.send(sens).await {
-                        error!(message = "Sensor listener hung up?", err= ?err);
-                    }
+                    tx.send(sens)
+                        .await
+                        .with_context(|| "Sensor processor hung up")?;
                 }
             };
-
             let stream = device.receive_manufacturer_data_changed().await;
             // Spawn a task to poll this device's stream
             let listener = tokio::spawn(manufacturer_listener(stream, tx));
@@ -322,7 +363,7 @@ mod mybus {
             connection: &zbus::Connection,
             object_path: OwnedObjectPath,
             tx: mpsc::Sender<SensorValues>,
-        ) -> zbus::Result<MyDev<'static>> {
+        ) -> anyhow::Result<MyDev<'static>> {
             let dev_proxy = Device1Proxy::builder(connection)
                 .destination("org.bluez")?
                 .path(object_path)?
@@ -355,19 +396,19 @@ mod mybus {
             write!(f, "MyDev(")?;
             match self.name.as_ref() {
                 Some(name) => write!(f, "name={}, ", &name)?,
-                None => write!(f, "no_name, ")?,
+                None => write!(f, "name=, ")?,
             }
 
             match self.address.as_ref() {
                 Some(addr) => write!(f, "address={}, ", &addr)?,
-                None => write!(f, "no_address, ")?,
+                None => write!(f, "address=, ")?,
             }
             write!(f, "dbus_path={})", path)
         }
     }
 
     #[tracing::instrument(skip_all, fields(name))]
-    pub async fn adapter_start_discovery(adapter: &Adapter1Proxy<'_>) -> zbus::Result<()> {
+    pub async fn adapter_start_discovery(adapter: &Adapter1Proxy<'_>) -> anyhow::Result<()> {
         let name = adapter.name().await?;
         tracing::Span::current().record("name", &name);
 
@@ -386,8 +427,8 @@ mod mybus {
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn stop_discovery(connection: &zbus::Connection) -> zbus::Result<()> {
-        for adapter in find_adapters(&connection).await? {
+    pub async fn stop_discovery(connection: &zbus::Connection) -> anyhow::Result<()> {
+        for adapter in find_adapters(connection).await? {
             let name = adapter.name().await?;
             info!(name = name, "Stopping adapter discovery");
             adapter.stop_discovery().await?;
@@ -396,7 +437,7 @@ mod mybus {
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn start_discovery(connection: &zbus::Connection) -> zbus::Result<()> {
+    pub async fn start_discovery(connection: &zbus::Connection) -> anyhow::Result<()> {
         let adapters = find_adapters(connection).await?;
         for adapter in &adapters {
             adapter_start_discovery(adapter).await?;
@@ -404,26 +445,39 @@ mod mybus {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip_all, fields(name))]
+    async fn manufacturer_data_one(
+        v: zbus::PropertyChanged<'_, HashMap<u16, Vec<u8>>>,
+    ) -> anyhow::Result<Option<SensorValues>> {
+        // Mostly internal cruft that could live in "manufacturer_listener" but turns the inner
+        // logic hard to read, and also ends up doing somewhat nasty things to the current span
+        // with fields.
+        // Thats why it's an helper
+        let name = v.name();
+        tracing::Span::current().record("name", v.name());
+        let value = v.get().await;
+        if name == "ManufacturerData" {
+            trace!(message = "Device Signal",  value = ?value);
+            if let Ok(val) = value {
+                return Ok(from_manuf(val));
+            }
+        } else {
+            warn!(message = "Unknown signal", value = ?value);
+        }
+        Ok(None)
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn manufacturer_listener(
         mut stream: zbus::PropertyStream<'_, HashMap<u16, Vec<u8>>>,
         tx: mpsc::Sender<SensorValues>,
-    ) {
+    ) -> anyhow::Result<()> {
         while let Some(v) = stream.next().await {
-            let value = v.get().await;
-            trace!(message = "Device Signal",  name = ?v.name(),  value = ?value);
-            if v.name() == "ManufacturerData" {
-                if let Ok(val) = v.get().await {
-                    if let Some(sens) = from_manuf(val) {
-                        if let Err(err) = tx.send(sens).await {
-                            error!(err = ?err, "Failed to process sensor value");
-                        }
-                    }
-                }
-            } else {
-                warn!(message = "Unknown signal", name = ?v.name(), value = ?value);
+            if let Some(decoded) = manufacturer_data_one(v).await? {
+                tx.send(decoded).await?
             }
         }
+        Ok(())
     }
 }
 mod devices {
@@ -466,7 +520,10 @@ mod devices {
         }
 
         #[tracing::instrument(level = "info", skip_all)]
-        pub async fn handle_removed_signal(&self, data: zbus::fdo::InterfacesRemovedArgs<'_>) {
+        pub async fn handle_removed_signal(
+            &self,
+            data: zbus::fdo::InterfacesRemovedArgs<'_>,
+        ) -> anyhow::Result<()> {
             let object_path = OwnedObjectPath::from(data.object_path);
             // Having the debug line below forces us to de-serialize the entire rest even when
             // we don't care about it.
@@ -479,8 +536,10 @@ mod devices {
                 let mut devices = match self.pmap.lock() {
                     Ok(devices) => devices,
                     Err(err) => {
-                        error!(err = ? err, message = "Failed to unlock removed device due to poison");
-                        return;
+                        error!(err = ? err, message = "Another worker died while holding a mutex lock");
+                        return Err(anyhow::Error::msg(
+                            "Another worker died while holding a mutex lock",
+                        ));
                     }
                 };
                 devices.remove(&object_path)
@@ -489,17 +548,24 @@ mod devices {
                 info!(message = "Device disconnected", device = %device);
                 device.bye().await;
             }
+            Ok(())
         }
 
         #[tracing::instrument(level = "info", skip_all)]
-        async fn store_device(&self, object_path: OwnedObjectPath, device: MyDev<'static>) {
+        async fn store_device(
+            &self,
+            object_path: OwnedObjectPath,
+            device: MyDev<'static>,
+        ) -> anyhow::Result<()> {
             {
                 let old = {
                     let mut devices = match self.pmap.lock() {
                         Ok(devices) => devices,
                         Err(err) => {
                             error!(err = ? err, message = "Failed to unlock due to poison");
-                            return;
+                            return Err(anyhow::Error::msg(
+                                "Another worker died while holding a mutex lock",
+                            ));
                         }
                     };
                     devices.insert(object_path, device)
@@ -509,9 +575,14 @@ mod devices {
                     old.bye().await;
                 }
             }
+            Ok(())
         }
         #[tracing::instrument(level = "info", skip_all)]
-        pub async fn handle_added_signal(&self, data: zbus::fdo::InterfacesAddedArgs<'_>) {
+        pub async fn handle_added_signal(
+            &self,
+            data: zbus::fdo::InterfacesAddedArgs<'_>,
+        ) -> anyhow::Result<()> {
+            use anyhow::Context;
             // Data looks like this:
             // Interfaces Added: data=InterfacesAdded { object_path: ObjectPath("/org/bluez/hci0/dev_C4_47_33_92_F2_96"), interfaces_and_properties: {"org.freedesktop.DBus.Introspectable": {}, "org.bluez.Device1": {"Alias": Str(Str(Borrowed("C4-47-33-92-F2-96"))), "Trusted": Bool(false), "Connected": Bool(false), "Adapter": ObjectPath(ObjectPath("/org/bluez/hci0")), "UUIDs": Array(Array { element_signature: Signature("s"), elements: [], signature: Signature("as") }), "Paired": Bool(false), "AddressType": Str(Str(Borrowed("random"))), "Blocked": Bool(false), "ServicesResolved": Bool(false), "Address": Str(Str(Borrowed("C4:47:33:92:F2:96"))), "Bonded": Bool(false), "AdvertisingFlags": Array(Array { element_signature: Signature("y"), elements: [U8(0)], signature: Signature("ay") }), "LegacyPairing": Bool(false), "ManufacturerData": Dict(Dict { entries: [DictEntry { key: U16(76), value: Value(Array(Array { element_signature: Signature("y"), elements: [U8(18), U8(2), U8(0), U8(2)], signature: Signature("ay") })) }], key_signature: Signature("q"), value_signature: Signature("v"), signature: Signature("a{qv}") }), "RSSI": I16(-77)}, "org.freedesktop.DBus.Properties": {}} }
 
@@ -524,9 +595,10 @@ mod devices {
                 .iter()
                 .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE)
             {
-                if let Err(err) = start_discovery(&connection).await {
-                    error!(message = "Failed to start discovery on new adapter",  err=?err, data=?data);
-                }
+                start_discovery(&connection).await.with_context(|| {
+                    error!(message = "Failed to start discovery on new adapter", data=?data);
+                    format!("Failed to start discovery on new adapter {data:?}")
+                })?;
             }
             let object_path = OwnedObjectPath::from(data.object_path);
             if data
@@ -536,22 +608,20 @@ mod devices {
             {
                 // Clone the data so we can just toss it without caring about lifetimes.
                 // The "biggest" is a string for the path.
-                if let Ok(device) =
-                    MyDev::from_data(&connection, object_path.clone(), tx.clone()).await
-                {
-                    self.store_device(object_path, device).await;
-                }
+                let device = MyDev::from_data(&connection, object_path.clone(), tx.clone()).await?;
+                self.store_device(object_path, device).await?;
             }
+            Ok(())
         }
 
         #[tracing::instrument(level = "info", skip_all)]
-        pub async fn initial_subscription(&self) -> Result<(), Box<dyn std::error::Error>> {
+        pub async fn initial_subscription(&self) -> anyhow::Result<()> {
             let connection = self.connection.clone();
             info!(message = "Subscribing to pre-existing devices");
             for dev_proxy in find_devices(&connection).await? {
                 let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
                 let device = MyDev::new(dev_proxy, self.tx.clone()).await?;
-                self.store_device(object_path, device).await;
+                self.store_device(object_path, device).await?;
             }
             Ok(())
         }
@@ -560,7 +630,7 @@ mod devices {
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn find_devices<'device>(
         connection: &zbus::Connection,
-    ) -> zbus::Result<Vec<Device1Proxy<'device>>> {
+    ) -> anyhow::Result<Vec<Device1Proxy<'device>>> {
         let bluez_root = zbus::fdo::ObjectManagerProxy::builder(connection)
             .destination("org.bluez")?
             .path("/")?
@@ -596,45 +666,62 @@ mod devices {
         Ok(result)
     }
 
-    pub async fn run_lostfound_actor(actor: LostFound) {
-        // Lets try to get some changes on the devices
-        let bluez_root = zbus::fdo::ObjectManagerProxy::builder(&actor.connection)
-            .destination("org.bluez")
-            .unwrap()
-            .path("/")
-            .unwrap()
+    use zbus::fdo::InterfacesAddedStream;
+    use zbus::fdo::InterfacesRemovedStream;
+
+    // Inner function so we can get cleaner error handling.
+    async fn subscribe_interfaces(
+        connection: &zbus::Connection,
+    ) -> anyhow::Result<(
+        InterfacesRemovedStream<'static>,
+        InterfacesAddedStream<'static>,
+    )> {
+        let bluez_root = zbus::fdo::ObjectManagerProxy::builder(connection)
+            .destination("org.bluez")?
+            .path("/")?
             .build()
+            .await?;
+        let removed = bluez_root.receive_interfaces_removed().await?;
+        let added = bluez_root.receive_interfaces_added().await?;
+        Ok((removed, added))
+    }
+
+    pub async fn run_lostfound_actor(actor: LostFound) -> anyhow::Result<()> {
+        use anyhow::Context;
+        // Lets try to get some changes on the devices
+        let (mut removed, mut added) = subscribe_interfaces(&actor.connection)
             .await
-            .unwrap();
-        let mut removed = bluez_root.receive_interfaces_removed().await.unwrap();
-        let mut added = bluez_root.receive_interfaces_added().await.unwrap();
+            .with_context(|| "Failed to subscribe to interface changes")?;
+
         // Only iterate and subscribe _after_ we have set up the listeners, or we may (maybe) miss
         // a device that appeared in this tiny race window.
         actor
             .initial_subscription()
             .await
-            .expect("Failed to subscribe to devices");
-
+            .with_context(|| "Failed during intiial subscription to Bluetooth devices.")?;
         info!("Tracking bluetooth device appearance and disappearance");
         loop {
             tokio::select! {
                 Some(rem_sig) = removed.next() => {
                     if let Ok(data) = rem_sig.args() {
-                        actor.handle_removed_signal(data).await
+                        actor.handle_removed_signal(data).await?
                     }
                 },
                 Some(add_sig) = added.next() => {
                     if let Ok(data) = add_sig.args() {
-                        actor.handle_added_signal(data).await
+                        actor.handle_added_signal(data).await?
                     }
                 },
                 else => break,
             }
         }
+        Err(anyhow::Error::msg(
+            "lostfound dbus handler failed succesfully",
+        ))
     }
 }
 
-async fn real_main() -> Result<(), Box<dyn Error>> {
+async fn real_main() -> anyhow::Result<()> {
     let mut connection = zbus::Connection::system().await?;
     connection.set_max_queued(1200);
 
@@ -654,7 +741,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     #[cfg(feature = "modio")]
     let rx = if cfg!(feature = "modio") {
         let (modio_tx, modio_rx) = mpsc::channel(100);
-        let modio_actor = modio::SensorActor::new(rx, modio_tx).await;
+        let modio_actor = modio::SensorActor::new(rx, modio_tx).await?;
         tasks.push(tokio::spawn(modio::run_sensor_actor(modio_actor)));
         modio_rx
     } else {
@@ -683,10 +770,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 
     if cfg!(feature = "modio") || cfg!(feature = "prometheus") {
         // Drain the pipe at the end, leaving only silence.
-        let mut rx = rx;
-        tasks.push(tokio::spawn(
-            async move { while (rx.recv().await).is_some() {} },
-        ));
+        tasks.push(tokio::spawn(data::run_drain_channel(rx)));
     }
     // the LogActor acts as a drain, being the last on a chain of channels between
     // modio/prometheus/other channels
@@ -695,34 +779,75 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         tasks.push(tokio::spawn(data::run_logger_actor(log_actor)));
     }
 
-    if let Err(err) = start_discovery(&connection).await {
-        error!(message = "Failed to start discovery. Airplane mode?", err = %err);
-        return Err(Box::new(err));
-    }
+    start_discovery(&connection)
+        .await
+        .with_context(|| "Failed to start discovery. Airplane mode?")?;
 
     let mut futs = tasks
         .into_iter()
         .collect::<FuturesUnordered<JoinHandle<_>>>();
 
-    if let Some(task_result) = futs.next().await {
-        error!("A task that was meant to run forever has ended.");
-        match task_result {
-            Ok(_) => warn!(message = "Task ended succesfully"),
-            Err(err) => {
-                error!(message = "Task ended badly.", err = ?err, errtxt = err.to_string());
-                if let Ok(reason) = err.try_into_panic() {
-                    // Resume the panic on the main task
-                    std::panic::resume_unwind(reason);
+    let delay = std::time::Duration::from_secs(30);
+    let mut waiter = tokio::time::interval(delay);
+
+    // Since our tasks failing will cause a cascade, but some tasks may still be running,  timeouts may happen, it's not always that
+    // the first error seen is the one causing an issue.
+    // Thus, we iterate for all of them, and log all the errors.
+    let mut first_error = None;
+
+    // This is a bit more complex than I want it to be, but as we do not want to see the FIRST
+    // error that happens, as that may not be the _root_cause_ error. Fex, modio-logger
+    // disconnecting may cause the next one in line to drop, as it will get "writer to my read
+    // channel hung up" error.
+    //
+    // Thus, I've implemented some hacky loop here. We loop forever, but in intervals of $delay, we
+    // sleep, but break if there _is_ an
+    // error and we have looped for a certain time.
+    //
+    // In the first branch, however, we check the results and attempt to log tasks that succeed
+    // unexpectedly, and tasks that fail
+    //
+    // Succeed unexpectedly will happen if we wait for events and get notified that the write
+    // side disappeared, this means it was a victim of another process terminating, which is Ok,
+    // but an error
+    //
+    loop {
+        tokio::select! {
+            task = futs.next() => {
+                // Futs.next() is a future,  None means no more tasks, Some means task.
+                if let Some(task) = task {
+                    let task_result = task?;
+                    match task_result {
+                        Ok(_) => warn!(message = "Task ended succesfully but shouldn't have"),
+                        Err(err) => {
+                            error!(err = ?err, errtxt = err.to_string(), "Task ended badly.");
+                            // Replace content in `first_error` if it is None
+                            first_error.get_or_insert(err);
+                        }
+                    }
+                // None, we have no more tasks. Not breaking here would cause an infinte loop.
+                } else {
+                    warn!("Consumed the last worker task. Exiting.");
+                    break;
+                }
+            }
+            _t = waiter.tick() => {
+                if first_error.is_some() {
+                    warn!("Timeout happened and we have an error. Exiting.");
+                    break;
                 }
             }
         }
     }
     stop_discovery(&connection).await?;
+    if let Some(err) = first_error {
+        return Err(err);
+    };
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     real_main().await
 }

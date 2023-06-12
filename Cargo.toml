@@ -22,6 +22,8 @@ zbus = { version = "3", default-features = false, features = ["tokio"] }
 #futures-lite = "*"
 futures = { version = "*", default-features = false }
 fsipc =  { version = "~0.9.2", optional = true}
+thiserror = "1.0.40"
+anyhow = "1.0.71"
 
 [profile.release]
 strip = true

@@ -1,4 +1,5 @@
 use crate::data::DecodedSensor;
+use anyhow::Context;
 use ruuvi_sensor_protocol::SensorValues;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -12,46 +13,53 @@ impl SensorActor {
     pub async fn new(
         receiver: mpsc::Receiver<SensorValues>,
         sender: mpsc::Sender<SensorValues>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         // modio connection stuff
         let session = std::env::args().any(|arg| arg == "--session");
         let connection = if session {
-            zbus::Connection::session().await.unwrap()
+            zbus::Connection::session().await?
         } else {
-            zbus::Connection::system().await.unwrap()
+            zbus::Connection::system().await?
         };
-        SensorActor {
+        Ok(SensorActor {
             receiver,
             sender,
             connection,
-        }
+        })
     }
 
-    pub async fn handle_message(
-        &mut self,
-        msg: SensorValues,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<SensorValues>> {
-        modio_log_sensor(&self.connection, &msg).await;
-        self.sender.send(msg).await
-    }
-}
-
-pub async fn run_sensor_actor(mut actor: SensorActor) {
-    info!("Prepared to store data to modio-logger");
-    while let Some(msg) = actor.receiver.recv().await {
-        actor
-            .handle_message(msg)
+    // No point in logging the raw sensor-values at anything but trace level.
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn handle_message(&mut self, msg: SensorValues) -> anyhow::Result<()> {
+        modio_log_sensor(&self.connection, &msg)
             .await
-            .expect("Unknown failure in channel");
+            .with_context(|| "Failed to commmunicate with modio-logger. Is it running?")?;
+        self.sender
+            .send(msg)
+            .await
+            .with_context(|| "Failed to pass message on to next listener")?;
+        Ok(())
     }
 }
 
 #[tracing::instrument(skip_all)]
-async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) {
+pub async fn run_sensor_actor(mut actor: SensorActor) -> anyhow::Result<()> {
+    info!("Prepared to store data to modio-logger");
+    while let Some(msg) = actor.receiver.recv().await {
+        actor.handle_message(msg).await?;
+    }
+    let err = anyhow::Error::msg("No more sensor values");
+    Err(err)
+}
+
+#[tracing::instrument(skip_all)]
+async fn modio_log_sensor(
+    connection: &zbus::Connection,
+    sensor: &SensorValues,
+) -> anyhow::Result<()> {
     let ipc = fsipc::legacy::fsipcProxy::builder(connection)
         .build()
-        .await
-        .unwrap();
+        .await?;
     let decoder = DecodedSensor::new(sensor);
     if let Some(mac) = decoder.mac() {
         for (name, val, unit) in decoder {
@@ -63,7 +71,10 @@ async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) 
                 unit = unit,
                 "Storing metric"
             );
-            ipc.store(&key, &val).await.unwrap();
+            ipc.store(&key, &val)
+                .await
+                .with_context(|| "fsipcProxy store gave error")?;
         }
     }
+    Ok(())
 }

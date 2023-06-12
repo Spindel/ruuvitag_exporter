@@ -132,14 +132,13 @@ impl SensorActor {
         self.sender.send(msg).await
     }
 }
-pub async fn run_sensor_actor(mut actor: SensorActor) {
+pub async fn run_sensor_actor(mut actor: SensorActor) -> anyhow::Result<()> {
     info!("Logging data to prometheus");
     while let Some(msg) = actor.receiver.recv().await {
-        actor
-            .handle_message(msg)
-            .await
-            .expect("Unknown failure in channel");
+        actor.handle_message(msg).await?
     }
+    let err = anyhow::Error::msg("No more sensor values");
+    Err(err)
 }
 
 #[tracing::instrument(level = "trace", skip_all)]

@@ -85,7 +85,9 @@ async fn router(req: Request<Body>) -> Result<Response<Body>, Error> {
 }
 
 #[tracing::instrument]
-pub(crate) async fn webserver(addr: SocketAddr) {
+pub(crate) async fn webserver(addr: SocketAddr) -> anyhow::Result<()> {
+    use anyhow::Context;
+
     // For every connection, we must make a `Service` to handle all
     // incoming HTTP requests on said connection.
     let make_svc = make_service_fn(|_conn| {
@@ -95,23 +97,10 @@ pub(crate) async fn webserver(addr: SocketAddr) {
         async { Ok::<_, hyper::Error>(service_fn(router)) }
     });
 
-    let server = match Server::try_bind(&addr) {
-        Ok(server) => {
-            info!(message = "Listening on ", %addr);
-            server
-        }
-        Err(e) => {
-            error!(message = "Failed to bind port", err = ?e);
-            return;
-        }
-    };
+    let server = Server::try_bind(&addr).with_context(|| format!("Failed to bind port {addr}"))?;
+    info!(message = "Listening on ", %addr);
 
-    match server.serve(make_svc).await {
-        Ok(_) => {
-            info!("Happy webserver ending");
-        }
-        Err(e) => {
-            error!(message = "Webserver failure", err = ?e);
-        }
-    }
+    server.serve(make_svc).await?;
+    info!("Happy webserver ending");
+    Ok(())
 }
