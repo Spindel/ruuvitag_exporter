@@ -61,3 +61,15 @@ Export the environment variables to make it useful:
 Then build:
 
     cargo build --target aarch64-unknown-linux-gnu --release
+
+# For a modio logger rather than prometheus exporter
+
+The Modio logger works over DBus and acts as a cache/forwarder to online
+services, like MQTT and others.
+
+To build for that as a target, use:
+
+    RUST_LOG=info cargo run --features modio --no-default-features -- --session
+
+Note that a modio-logger needs to listen to the session bus (or system bus,
+default) for it to function. 

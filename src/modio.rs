@@ -55,8 +55,14 @@ async fn modio_log_sensor(connection: &zbus::Connection, sensor: &SensorValues) 
     let decoder = DecodedSensor::new(sensor);
     if let Some(mac) = decoder.mac() {
         for (name, val, unit) in decoder {
-            debug!(value = val, name = name, unit = unit, "Decoded value");
             let key = format!("ruuvi.{mac}.{name}");
+            debug!(
+                key = key,
+                value = val,
+                name = name,
+                unit = unit,
+                "Storing metric"
+            );
             ipc.store(&key, &val).await.unwrap();
         }
     }

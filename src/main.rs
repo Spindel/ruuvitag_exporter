@@ -10,10 +10,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use mybus::find_adapters;
 use mybus::start_discovery;
+use mybus::stop_discovery;
 
 mod addr;
 mod bluez;
@@ -25,9 +25,11 @@ mod prom;
 #[cfg(feature = "prometheus")]
 mod serve;
 
+#[tracing::instrument(level = "trace")]
 fn from_manuf(manufacturer_data: HashMap<u16, Vec<u8>>) -> Option<SensorValues> {
     for (k, v) in manufacturer_data {
         if let Ok(sensor) = SensorValues::from_manufacturer_specific_data(k, &v) {
+            debug!(data = ?sensor, "Ruuvi tag data decoded");
             return Some(sensor);
         }
     }
@@ -46,6 +48,7 @@ mod data {
         Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
         Temperature, TransmitterPower,
     };
+
     pub struct LogActor {
         receiver: mpsc::Receiver<SensorValues>,
     }
@@ -383,6 +386,16 @@ mod mybus {
     }
 
     #[tracing::instrument(skip_all)]
+    pub async fn stop_discovery(connection: &zbus::Connection) -> zbus::Result<()> {
+        for adapter in find_adapters(&connection).await? {
+            let name = adapter.name().await?;
+            info!(name = name, "Stopping adapter discovery");
+            adapter.stop_discovery().await?;
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
     pub async fn start_discovery(connection: &zbus::Connection) -> zbus::Result<()> {
         let adapters = find_adapters(connection).await?;
         for adapter in &adapters {
@@ -402,9 +415,8 @@ mod mybus {
             if v.name() == "ManufacturerData" {
                 if let Ok(val) = v.get().await {
                     if let Some(sens) = from_manuf(val) {
-                        debug!(message = "Ruuvi data decoded",  data = ?sens);
                         if let Err(err) = tx.send(sens).await {
-                            error!(message = "Failed to process sensor value", err = ?err);
+                            error!(err = ?err, "Failed to process sensor value");
                         }
                     }
                 }
@@ -669,10 +681,19 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         rx
     };
 
+    if cfg!(feature = "modio") || cfg!(feature = "prometheus") {
+        // Drain the pipe at the end, leaving only silence.
+        let mut rx = rx;
+        tasks.push(tokio::spawn(
+            async move { while (rx.recv().await).is_some() {} },
+        ));
+    }
     // the LogActor acts as a drain, being the last on a chain of channels between
     // modio/prometheus/other channels
-    let log_actor = data::LogActor::new(rx).await;
-    tasks.push(tokio::spawn(data::run_logger_actor(log_actor)));
+    else {
+        let log_actor = data::LogActor::new(rx).await;
+        tasks.push(tokio::spawn(data::run_logger_actor(log_actor)));
+    }
 
     if let Err(err) = start_discovery(&connection).await {
         error!(message = "Failed to start discovery. Airplane mode?", err = %err);
@@ -684,16 +705,19 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
         .collect::<FuturesUnordered<JoinHandle<_>>>();
 
     if let Some(task_result) = futs.next().await {
-        error!("Something ended and I do not know what or why.");
+        error!("A task that was meant to run forever has ended.");
         match task_result {
             Ok(_) => warn!(message = "Task ended succesfully"),
-            Err(err) => error!(message = "Task ended badly.", err = ?err),
+            Err(err) => {
+                error!(message = "Task ended badly.", err = ?err, errtxt = err.to_string());
+                if let Ok(reason) = err.try_into_panic() {
+                    // Resume the panic on the main task
+                    std::panic::resume_unwind(reason);
+                }
+            }
         }
     }
-    // All done, shut down
-    for adapter in find_adapters(&connection).await? {
-        adapter.stop_discovery().await?;
-    }
+    stop_discovery(&connection).await?;
     Ok(())
 }
 
