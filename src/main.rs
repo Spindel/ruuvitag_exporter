@@ -134,7 +134,7 @@ mod data {
         // Tracking the unit here vs. in the decoder is a bit ugly, and requires them to be kept
         // in sync.
         pub fn senml_str(&self) -> &str {
-            use DecidedSensorState::*;
+            use DecidedSensorState::{AccelX, AccelY, AccelZ, Done, Humidity, Movement, Pressure, Temperature, Txpow, Volts};
             match self {
                 Humidity => "/",
                 Pressure => "Pa",
