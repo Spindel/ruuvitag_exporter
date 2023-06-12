@@ -374,7 +374,7 @@ mod mybus {
                 Some(addr) => write!(f, "address={}, ", &addr)?,
                 None => write!(f, "address=, ")?,
             }
-            write!(f, "dbus_path={})", path)
+            write!(f, "dbus_path={path})")
         }
     }
 
