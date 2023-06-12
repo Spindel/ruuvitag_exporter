@@ -116,7 +116,7 @@ mod data {
 
     impl DecidedSensorState {
         pub fn as_str(&self) -> &str {
-            use DecidedSensorState::*;
+            use DecidedSensorState::{AccelX, AccelY, AccelZ, Done, Humidity, Movement, Pressure, Temperature, Txpow, Volts};
             match self {
                 Humidity => "humidity",
                 Pressure => "pressure",
