@@ -479,7 +479,7 @@ mod devices {
             }
         }
 
-        #[tracing::instrument(level = "info")]
+        #[tracing::instrument(level = "info", skip_all)]
         async fn store_device(&self, object_path: OwnedObjectPath, device: MyDev<'static>) {
             {
                 let old = {
