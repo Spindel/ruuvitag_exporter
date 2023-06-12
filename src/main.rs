@@ -146,7 +146,7 @@ mod data {
                 Pressure => "Pa",
                 Temperature => "Cel",
                 Volts => "V",
-                Txpow => "dBm",
+                Txpow => "dBW",
                 Movement => "count",
                 AccelX | AccelY | AccelZ => "g",
                 Done => "",
@@ -195,7 +195,7 @@ mod data {
                     .battery_potential_as_millivolts()
                     .map(f64::from)
                     .map(|num| num / 1000.0),
-                DecidedSensorState::Txpow => self.sensor.tx_power_as_dbm().map(f64::from),
+                DecidedSensorState::Txpow => self.sensor.tx_power_as_dbm().map(|x| f64::from(x) - 30.0),
                 DecidedSensorState::Movement => self.sensor.movement_counter().map(f64::from),
                 DecidedSensorState::AccelX => self
                     .sensor
