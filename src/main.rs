@@ -312,6 +312,10 @@ mod mybus {
                 tracing::Span::current().record("address", &address);
             }
 
+            let stream = device.receive_manufacturer_data_changed().await;
+            // Spawn a task to poll this device's stream
+            let listener = tokio::spawn(manufacturer_listener(stream, tx.clone()));
+
             debug!(message = "Gathering manufacturer data");
             if let Ok(manuf_data) = device.manufacturer_data().await {
                 if let Some(sens) = from_manuf(manuf_data) {
@@ -320,9 +324,6 @@ mod mybus {
                         .with_context(|| "Sensor processor hung up")?;
                 }
             };
-            let stream = device.receive_manufacturer_data_changed().await;
-            // Spawn a task to poll this device's stream
-            let listener = tokio::spawn(manufacturer_listener(stream, tx));
 
             let res = Self {
                 device,
