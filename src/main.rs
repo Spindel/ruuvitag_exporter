@@ -46,7 +46,7 @@ mod data {
     // Traits
     use ruuvi_sensor_protocol::{
         Acceleration, BatteryPotential, Humidity, MacAddress, MovementCounter, Pressure,
-        Temperature, TransmitterPower,
+        Temperature, TransmitterPower, MeasurementSequenceNumber,
     };
 
     #[tracing::instrument(level = "debug")]
@@ -71,7 +71,7 @@ mod data {
     ) -> anyhow::Result<()> {
         use tokio::time::timeout;
         let mut count = 0;
-        let delay = std::time::Duration::from_secs(120);
+        let delay = std::time::Duration::from_secs(220);
 
         info!("Prepared to discard remaining data");
         loop {
@@ -102,6 +102,7 @@ mod data {
     // meaning of value and their units.
     #[derive(PartialEq)]
     enum DecidedSensorState {
+        Sequence,
         Humidity,
         Pressure,
         Temperature,
@@ -118,9 +119,10 @@ mod data {
         pub fn as_str(&self) -> &str {
             use DecidedSensorState::{
                 AccelX, AccelY, AccelZ, Done, Humidity, Movement, Pressure, Temperature, Txpow,
-                Volts,
+                Volts, Sequence,
             };
             match self {
+                Sequence => "seq_no",
                 Humidity => "humidity",
                 Pressure => "pressure",
                 Temperature => "temperature",
@@ -139,7 +141,7 @@ mod data {
         pub fn senml_str(&self) -> &str {
             use DecidedSensorState::{
                 AccelX, AccelY, AccelZ, Done, Humidity, Movement, Pressure, Temperature, Txpow,
-                Volts,
+                Volts, Sequence,
             };
             match self {
                 Humidity => "/",
@@ -147,7 +149,7 @@ mod data {
                 Temperature => "Cel",
                 Volts => "V",
                 Txpow => "dBW",
-                Movement => "count",
+                Movement | Sequence => "count",
                 AccelX | AccelY | AccelZ => "kg",
                 Done => "",
             }
@@ -163,7 +165,7 @@ mod data {
         pub fn new(sensor: &SensorValues) -> DecodedSensor<'_> {
             DecodedSensor {
                 sensor,
-                state: DecidedSensorState::Humidity,
+                state: DecidedSensorState::Sequence,
             }
         }
 
@@ -178,6 +180,10 @@ mod data {
         /// Decode the current value (marked by internal state variable) as an Option<f64>
         fn decode(&self) -> Option<f64> {
             match self.state {
+                DecidedSensorState::Sequence => self
+                    .sensor
+                    .measurement_sequence_number()
+                    .map(f64::from),
                 DecidedSensorState::Humidity => self
                     .sensor
                     .humidity_as_ppm()
@@ -229,6 +235,7 @@ mod data {
             let unit = self.state.senml_str().to_string();
             let val = self.decode();
             self.state = match self.state {
+                DecidedSensorState::Sequence => DecidedSensorState::Humidity,
                 DecidedSensorState::Humidity => DecidedSensorState::Pressure,
                 DecidedSensorState::Pressure => DecidedSensorState::Temperature,
                 DecidedSensorState::Temperature => DecidedSensorState::Volts,
@@ -314,10 +321,6 @@ mod mybus {
                 tracing::Span::current().record("address", &address);
             }
 
-            let stream = device.receive_manufacturer_data_changed().await;
-            // Spawn a task to poll this device's stream
-            let listener = tokio::spawn(manufacturer_listener(stream, tx.clone()));
-
             debug!(message = "Gathering manufacturer data");
             if let Ok(manuf_data) = device.manufacturer_data().await {
                 if let Some(sens) = from_manuf(manuf_data) {
@@ -326,6 +329,11 @@ mod mybus {
                         .with_context(|| "Sensor processor hung up")?;
                 }
             };
+
+            let stream = device.receive_manufacturer_data_changed().await;
+            // Spawn a task to poll this device's stream
+            let listener = tokio::spawn(manufacturer_listener(stream, tx));
+
 
             let res = Self {
                 device,
@@ -454,6 +462,7 @@ mod mybus {
                 tx.send(decoded).await?;
             }
         }
+        warn!("No new manufacturer data");
         Ok(())
     }
 }
@@ -522,7 +531,7 @@ mod devices {
                 devices.remove(&object_path)
             };
             if let Some(device) = device {
-                info!(message = "Device disconnected", device = %device);
+                info!(device = %device, "Device disconnected");
                 device.bye().await;
             }
             Ok(())
@@ -572,6 +581,7 @@ mod devices {
                 .iter()
                 .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE)
             {
+                info!("New adapter found, starting discovery");
                 start_discovery(&connection).await.with_context(|| {
                     error!(message = "Failed to start discovery on new adapter", data=?data);
                     format!("Failed to start discovery on new adapter {data:?}")
@@ -586,6 +596,7 @@ mod devices {
                 // Clone the data so we can just toss it without caring about lifetimes.
                 // The "biggest" is a string for the path.
                 let device = MyDev::from_data(&connection, object_path.clone(), tx.clone()).await?;
+                info!(device = %device, "Device connected");
                 self.store_device(object_path, device).await?;
             }
             Ok(())
@@ -598,6 +609,7 @@ mod devices {
             for dev_proxy in find_devices(&connection).await? {
                 let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
                 let device = MyDev::new(dev_proxy, self.tx.clone()).await?;
+                info!(device = %device, "Device connected");
                 self.store_device(object_path, device).await?;
             }
             Ok(())
