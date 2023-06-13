@@ -82,7 +82,12 @@ async fn modio_log_sensor(
                 info!(key = key, name = m_name, unit = unit, "Updating metadata");
                 lp.set_metadata_name(&key, &m_name).await?;
                 if let Err(msg) = lp.set_metadata_unit(&key, &unit).await {
-                    warn!(key = key, unit = unit, err = msg.to_string(), "Failed to set unit");
+                    warn!(
+                        key = key,
+                        unit = unit,
+                        err = msg.to_string(),
+                        "Failed to set unit"
+                    );
                 }
                 metadata.insert(key.clone());
             }
