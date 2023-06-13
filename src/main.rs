@@ -148,7 +148,7 @@ mod data {
                 Volts => "V",
                 Txpow => "dBW",
                 Movement => "count",
-                AccelX | AccelY | AccelZ => "g",
+                AccelX | AccelY | AccelZ => "kg",
                 Done => "",
             }
         }
@@ -201,17 +201,17 @@ mod data {
                     .sensor
                     .acceleration_vector_as_milli_g()
                     .map(|vec| f64::from(vec.0))
-                    .map(|num| num / 1000.0),
+                    .map(|num| num * 1e-6_f64),
                 DecidedSensorState::AccelY => self
                     .sensor
                     .acceleration_vector_as_milli_g()
                     .map(|vec| f64::from(vec.1))
-                    .map(|num| num / 1000.0),
+                    .map(|num| num * 1e-6_f64),
                 DecidedSensorState::AccelZ => self
                     .sensor
                     .acceleration_vector_as_milli_g()
                     .map(|vec| f64::from(vec.2))
-                    .map(|num| num / 1000.0),
+                    .map(|num| num * 1e-6_f64),
                 DecidedSensorState::Done => None,
             }
         }
