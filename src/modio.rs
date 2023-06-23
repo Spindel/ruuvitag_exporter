@@ -4,6 +4,7 @@ use ruuvi_sensor_protocol::SensorValues;
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use fsipc::logger1::Logger1Proxy;
 
 pub struct SensorActor {
     receiver: mpsc::Receiver<SensorValues>,
@@ -57,51 +58,43 @@ pub async fn run_sensor_actor(mut actor: SensorActor) -> anyhow::Result<()> {
     Err(err)
 }
 
+// Inner function for log sensor to make the body of the loop neater
+async fn update_metadata(ipc: &Logger1Proxy<'_>, mac: &str, key: &str, unit: &str, name: &str) -> anyhow::Result<()> {
+    let m_name = format!("Ruuvi: {mac}: {name}");
+    info!(key = key, name = m_name, unit = unit, "Updating metadata");
+    ipc.set_metadata_name(key, &m_name).await?;
+    if let Err(msg) = ipc.set_metadata_unit(key, unit).await {
+        warn!(key = key, unit = unit, err = msg.to_string(), "Failed to set unit");
+    }
+    Ok(())
+}
+
 #[tracing::instrument(skip_all)]
 async fn modio_log_sensor(
     connection: &zbus::Connection,
     sensor: &SensorValues,
     metadata: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    use fsipc::logger1::Logger1Proxy;
-    let ipc = fsipc::legacy::fsipcProxy::builder(connection)
+    use std::collections::HashMap;
+    let ipc = Logger1Proxy::builder(connection)
         .build()
         .await?;
 
     let decoder = DecodedSensor::new(sensor);
     if let Some(mac) = decoder.mac() {
-        for (name, val, unit) in decoder {
-            let key = format!("ruuvi.{mac}.{name}");
+        let mut batch: HashMap<String, zbus::zvariant::Value<'_>> = HashMap::new();
+
+        for (key, name, val, unit) in decoder {
             if !metadata.contains(&key) {
-                let lp = Logger1Proxy::builder(connection)
-                    .destination("se.modio.logger")?
-                    .path("/se/modio/logger")?
-                    .build()
-                    .await?;
-                let m_name = format!("Ruuvi: {mac}: {name}");
-                info!(key = key, name = m_name, unit = unit, "Updating metadata");
-                lp.set_metadata_name(&key, &m_name).await?;
-                if let Err(msg) = lp.set_metadata_unit(&key, &unit).await {
-                    warn!(
-                        key = key,
-                        unit = unit,
-                        err = msg.to_string(),
-                        "Failed to set unit"
-                    );
-                }
+                update_metadata(&ipc, &mac, &key, &unit, &name).await?;
                 metadata.insert(key.clone());
             }
-            debug!(
-                key = key,
-                value = val,
-                name = name,
-                unit = unit,
-                "Storing metric"
-            );
-            ipc.store(&key, &val)
-                .await
-                .with_context(|| "fsipcProxy store gave error")?;
-        }
+            debug!(key = key, value = ?val, name = name, unit = unit, "Storing metric");
+            batch.insert(key, val.into());
+        };
+        ipc.store(batch)
+            .await
+            .with_context(|| "Logger1Proxy store gave error")?;
     }
     Ok(())
 }

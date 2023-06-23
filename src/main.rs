@@ -53,9 +53,9 @@ mod data {
     pub fn log_sensor(sensor: SensorValues) {
         let decoder = DecodedSensor::new(&sensor);
         if let Some(mac) = decoder.mac() {
-            for (name, val, unit) in decoder {
+            for (_, name, val, unit) in decoder {
                 info!(
-                    value = val,
+                    value = ?val,
                     name = name,
                     unit = unit,
                     mac = mac,
@@ -226,14 +226,17 @@ mod data {
     }
 
     impl Iterator for DecodedSensor<'_> {
-        type Item = (String, String, String);
+        type Item = (String, String, f64, String);
+
         fn next(&mut self) -> Option<Self::Item> {
             if self.state == DecidedSensorState::Done {
                 return None;
             }
+            let Some(mac) = self.mac() else { return None };
             let step = self.state.as_str().to_string();
             let unit = self.state.senml_str().to_string();
             let val = self.decode();
+            let key = format!("ruuvi.{mac}.{step}");
             self.state = match self.state {
                 DecidedSensorState::Sequence => DecidedSensorState::Humidity,
                 DecidedSensorState::Humidity => DecidedSensorState::Pressure,
@@ -246,7 +249,7 @@ mod data {
                 DecidedSensorState::AccelY => DecidedSensorState::AccelZ,
                 DecidedSensorState::AccelZ | DecidedSensorState::Done => DecidedSensorState::Done,
             };
-            val.map(|val| (step, val.to_string(), unit))
+            val.map(|val| (key, step, val, unit))
         }
     }
 }
