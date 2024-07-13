@@ -193,14 +193,15 @@ mod prom {
 
 mod serve {
     #![forbid(unsafe_code)]
-    use std::net::SocketAddr;
-
+    use http_body_util::Full;
     use hyper::http::Error;
-    use hyper::service::{make_service_fn, service_fn};
-    use hyper::{Body, Method, Request, Response, Server};
+    use hyper::service::service_fn;
+    use hyper::{body::Bytes, body::Incoming, Method, Request, Response};
+    use hyper_util::rt::TokioIo;
     use lazy_static::lazy_static;
     use prometheus::{register_histogram, register_int_counter, register_int_gauge};
     use prometheus::{Histogram, IntCounter, IntGauge};
+    use std::net::SocketAddr;
     use tracing::{debug, error, info};
 
     lazy_static! {
@@ -220,9 +221,15 @@ mod serve {
         )
         .expect("Could not create HTTP_REQ_HISTOGRAM metric. This should never fail.");
     }
+    // Helper to wrap some data into a Full http reply of Bytes
+    fn full<T: Into<Bytes>>(data: T) -> Full<Bytes> {
+        Full::new(data.into())
+    }
 
+    // A Response, that is Full (not streaming) and contains Bytes
+    type FullResponse = Response<Full<Bytes>>;
     #[tracing::instrument]
-    fn prometheus_to_response() -> Result<Response<Body>, Error> {
+    fn prometheus_to_response() -> Result<FullResponse, Error> {
         let metric_families = prometheus::gather();
         debug!(
             message = "Generating text output for metrics",
@@ -232,25 +239,25 @@ mod serve {
         let resp = match encoder.encode_to_string(&metric_families) {
             Ok(body_text) => {
                 HTTP_BODY_GAUGE.set(body_text.len() as i64);
-                let body = Body::from(body_text);
+                let body = full(body_text);
                 Response::new(body)
             }
             Err(error) => {
                 error!(message = "Error serializing prometheus data", err = %error);
-                let body = Body::from("Error serializing to prometheus");
+                let body = full("Error serializing to prometheus");
                 Response::builder().status(500).body(body)?
             }
         };
         Ok(resp)
     }
 
-    fn redirect() -> Result<Response<Body>, Error> {
+    fn redirect() -> Result<FullResponse, Error> {
         debug!(
             message = "Redirecting user",
             location = "/metrics",
             status = 301
         );
-        let body = Body::from("Go to /metrics \n");
+        let body = full("Go to /metrics \n");
         let resp = Response::builder()
             .status(301)
             .header("Location", "/metrics")
@@ -258,13 +265,13 @@ mod serve {
         Ok(resp)
     }
 
-    fn four_oh_four() -> Result<Response<Body>, Error> {
+    fn four_oh_four() -> Result<FullResponse, Error> {
         debug!(message = "Redirecting user", status = 404);
-        let resp = Response::builder().status(404).body(Body::empty())?;
+        let resp = Response::builder().status(404).body(Bytes::new().into())?;
         Ok(resp)
     }
 
-    async fn router(req: Request<Body>) -> Result<Response<Body>, Error> {
+    async fn router(req: Request<Incoming>) -> Result<FullResponse, Error> {
         HTTP_COUNTER.inc();
         let timer = HTTP_REQ_HISTOGRAM.start_timer();
         let resp = match (req.method(), req.uri().path()) {
@@ -281,19 +288,10 @@ mod serve {
 
     #[tracing::instrument]
     pub(crate) async fn webserver(addr: SocketAddr) {
-        // For every connection, we must make a `Service` to handle all
-        // incoming HTTP requests on said connection.
-        let make_svc = make_service_fn(|_conn| {
-            // This is the `Service` that will handle the connection.
-            // `service_fn` is a helper to convert a function that
-            // returns a Response into a `Service`.
-            async { Ok::<_, hyper::Error>(service_fn(router)) }
-        });
-
-        let server = match Server::try_bind(&addr) {
-            Ok(server) => {
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
                 info!(message = "Listening on ", %addr);
-                server
+                listener
             }
             Err(e) => {
                 error!(message = "Failed to bind port", err = ?e);
@@ -301,13 +299,26 @@ mod serve {
             }
         };
 
-        match server.serve(make_svc).await {
-            Ok(_) => {
-                info!("Happy webserver ending");
-            }
-            Err(e) => {
-                error!(message = "Webserver failure", err = ?e);
-            }
+        // For every connection, we must make a `Service` to handle all
+        // incoming HTTP requests on said connection.
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Err(err) => {
+                    error!(message = "Error accepting connection: {:?}", err=?err);
+                    return;
+                }
+                Ok(stream) => stream,
+            };
+            let io = TokioIo::new(stream);
+            tokio::task::spawn(async move {
+                // Finally, we bind the incoming connection to our `router` service
+                if let Err(err) = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service_fn(router))
+                    .await
+                {
+                    error!(message = "Error serving connection: {:?}", err=?err);
+                }
+            });
         }
     }
 }
