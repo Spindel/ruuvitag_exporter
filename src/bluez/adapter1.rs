@@ -22,7 +22,7 @@
 #![allow(non_snake_case)]
 use zbus::dbus_proxy;
 
-#[dbus_proxy(interface = "org.bluez.Adapter1")]
+#[dbus_proxy(interface = "org.bluez.Adapter1", assume_defaults = true)]
 trait Adapter1 {
     /// ConnectDevice method
     fn connect_device(
@@ -121,7 +121,10 @@ trait Adapter1 {
     fn uuids(&self) -> zbus::Result<Vec<String>>;
 }
 
-#[dbus_proxy(interface = "org.bluez.BatteryProviderManager1")]
+#[dbus_proxy(
+    interface = "org.bluez.BatteryProviderManager1",
+    assume_defaults = true
+)]
 trait BatteryProviderManager1 {
     /// RegisterBatteryProvider method
     fn register_battery_provider(
@@ -136,7 +139,7 @@ trait BatteryProviderManager1 {
     ) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(interface = "org.bluez.GattManager1")]
+#[dbus_proxy(interface = "org.bluez.GattManager1", assume_defaults = true)]
 trait GattManager1 {
     /// RegisterApplication method
     fn register_application(
@@ -152,7 +155,10 @@ trait GattManager1 {
     ) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(interface = "org.bluez.AdvertisementMonitorManager1")]
+#[dbus_proxy(
+    interface = "org.bluez.AdvertisementMonitorManager1",
+    assume_defaults = true
+)]
 trait AdvertisementMonitorManager1 {
     /// RegisterMonitor method
     fn register_monitor(&self, application: &zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
@@ -169,7 +175,7 @@ trait AdvertisementMonitorManager1 {
     fn supported_monitor_types(&self) -> zbus::Result<Vec<String>>;
 }
 
-#[dbus_proxy(interface = "org.bluez.Media1")]
+#[dbus_proxy(interface = "org.bluez.Media1", assume_defaults = true)]
 trait Media1 {
     /// RegisterApplication method
     fn register_application(
@@ -205,7 +211,7 @@ trait Media1 {
     fn unregister_player(&self, player: &zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(interface = "org.bluez.NetworkServer1")]
+#[dbus_proxy(interface = "org.bluez.NetworkServer1", assume_defaults = true)]
 trait NetworkServer1 {
     /// Register method
     fn register(&self, uuid: &str, bridge: &str) -> zbus::Result<()>;
@@ -214,7 +220,7 @@ trait NetworkServer1 {
     fn unregister(&self, uuid: &str) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(interface = "org.bluez.LEAdvertisingManager1")]
+#[dbus_proxy(interface = "org.bluez.LEAdvertisingManager1", assume_defaults = true)]
 trait LEAdvertisingManager1 {
     /// RegisterAdvertisement method
     fn register_advertisement(

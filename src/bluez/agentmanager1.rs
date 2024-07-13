@@ -22,7 +22,7 @@
 #![allow(non_snake_case)]
 use zbus::dbus_proxy;
 
-#[dbus_proxy(interface = "org.bluez.AgentManager1")]
+#[dbus_proxy(interface = "org.bluez.AgentManager1", assume_defaults = true)]
 trait AgentManager1 {
     /// RegisterAgent method
     fn register_agent(
@@ -38,7 +38,7 @@ trait AgentManager1 {
     fn unregister_agent(&self, agent: &zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(interface = "org.bluez.ProfileManager1")]
+#[dbus_proxy(interface = "org.bluez.ProfileManager1", assume_defaults = true)]
 trait ProfileManager1 {
     /// RegisterProfile method
     fn register_profile(
