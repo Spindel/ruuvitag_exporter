@@ -311,25 +311,54 @@ mod serve {
         }
     }
 }
+#[derive(Clone)]
+struct DeviceHash<'device> {
+    inner: Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>,
+}
+impl<'device> DeviceHash<'device> {
+    fn new() -> Self {
+        // Mapping of  the device path => device
+        // Used so we can remove device proxies that are out of date.
+        let inner = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, MyDev>::new()));
+        Self { inner }
+    }
+    fn remove(&self, object_path: &OwnedObjectPath) -> Option<MyDev<'device>> {
+        let mut devices = self
+            .inner
+            .lock()
+            .inspect_err(|err| error!(message = "Failed to lock devices", err=?err))
+            .ok()?;
+        devices.remove(object_path)
+    }
+    fn insert(
+        &self,
+        object_path: OwnedObjectPath,
+        device: MyDev<'device>,
+    ) -> Option<MyDev<'device>> {
+        let mut devices = self
+            .inner
+            .lock()
+            .inspect_err(|err| error!(message = "Failed to lock devices ", err=?err))
+            .ok()?;
+        devices.insert(object_path, device)
+    }
+}
 
 mod mybus {
     #![forbid(unsafe_code)]
+    use super::DeviceHash;
+    use crate::bluez::adapter1::Adapter1Proxy;
+    use crate::bluez::device1::Device1Proxy;
+    use crate::from_manuf;
+    use ruuvi_sensor_protocol::SensorValues;
     use std::collections::HashMap;
     use std::convert::From;
     use std::fmt;
-    use std::sync::{Arc, Mutex};
-
-    use ruuvi_sensor_protocol::SensorValues;
     use tokio::sync::mpsc;
     use tokio_stream::StreamExt;
     use tracing::{debug, error, info, trace, warn};
     use zbus::zvariant::OwnedObjectPath;
     use zbus::ProxyDefault; // Trait
-
-    use crate::bluez::adapter1::Adapter1Proxy;
-    use crate::bluez::device1::Device1Proxy;
-    use crate::from_manuf;
-    type DeviceHash<'device> = Arc<Mutex<HashMap<OwnedObjectPath, MyDev<'device>>>>;
 
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn find_adapters(connection: &zbus::Connection) -> zbus::Result<Vec<Adapter1Proxy>> {
@@ -412,22 +441,7 @@ mod mybus {
                 // we don't care about it.
                 // debug!(message = "DBus Interface removed", data = ?data);
 
-                // Since the mutex guard cant be held across await, we take it in a closure and
-                // return the resulting one, before going in.
-                // That way we don't hold the mutex across thread jumps
-                let device = {
-                    let mut devices = match pmap.lock() {
-                        Ok(devices) => devices,
-                        Err(err) => {
-                            error!(message = "Failed to lock device table", err = ?err);
-                            // Returning from this function will make the application end.
-                            // Do that here.
-                            return;
-                        }
-                    };
-                    devices.remove(&object_path)
-                };
-                if let Some(device) = device {
+                if let Some(device) = pmap.remove(&object_path) {
                     info!(message = "Device disconnected", device = %device);
                     device.bye().await;
                 }
@@ -560,17 +574,7 @@ mod mybus {
                     if let Ok(device) =
                         MyDev::from_data(&connection, object_path.clone(), tx.clone()).await
                     {
-                        let old = {
-                            let mut devices = match pmap.lock() {
-                                Ok(devices) => devices,
-                                Err(err) => {
-                                    error!(message = "Failed to unlock", err=?err);
-                                    return;
-                                }
-                            };
-                            devices.insert(object_path, device)
-                        };
-                        if let Some(old) = old {
+                        if let Some(old) = pmap.insert(object_path, device) {
                             info!(message = "Dropping old device for path", old = ?old);
                             old.bye().await;
                         }
@@ -634,10 +638,7 @@ mod mybus {
 async fn real_main() -> Result<(), Box<dyn Error>> {
     let mut connection = zbus::Connection::system().await?;
     connection.set_max_queued(1200);
-
-    // Mapping of  the device path => device
-    // Used so we can remove device proxies that are out of date.
-    let pmap = Arc::new(Mutex::new(HashMap::<OwnedObjectPath, MyDev>::new()));
+    let pmap = DeviceHash::new();
     let (tx, rx) = mpsc::channel(100);
 
     info!(message = "Setting up interface add and remove signals");
@@ -672,16 +673,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     for dev_proxy in find_devices(&connection).await? {
         let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
         let device = MyDev::new(dev_proxy, tx.clone()).await?;
-
-        match pmap.lock() {
-            Ok(mut devices) => {
-                devices.insert(object_path, device);
-            }
-            Err(err) => {
-                error!(message = "Failed to lock device table", err = ?err);
-                // Should I do something more here? Nah.
-            }
-        }
+        pmap.insert(object_path, device);
     }
 
     if let Err(err) = start_discovery(&connection).await {
