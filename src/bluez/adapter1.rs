@@ -20,9 +20,8 @@
 //! …consequently `zbus-xmlgen` did not generate code for the above interfaces.
 
 #![allow(non_snake_case)]
-use zbus::dbus_proxy;
 
-#[dbus_proxy(interface = "org.bluez.Adapter1", assume_defaults = true)]
+#[zbus::proxy(interface = "org.bluez.Adapter1", assume_defaults = true)]
 trait Adapter1 {
     /// ConnectDevice method
     fn connect_device(
@@ -49,79 +48,79 @@ trait Adapter1 {
     fn stop_discovery(&self) -> zbus::Result<()>;
 
     /// Address property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn address(&self) -> zbus::Result<String>;
 
     /// AddressType property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn address_type(&self) -> zbus::Result<String>;
 
     /// Alias property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn alias(&self) -> zbus::Result<String>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_alias(&self, value: &str) -> zbus::Result<()>;
 
     /// Class property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn class(&self) -> zbus::Result<u32>;
 
     /// Discoverable property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn discoverable(&self) -> zbus::Result<bool>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_discoverable(&self, value: bool) -> zbus::Result<()>;
 
     /// DiscoverableTimeout property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn discoverable_timeout(&self) -> zbus::Result<u32>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_discoverable_timeout(&self, value: u32) -> zbus::Result<()>;
 
     /// Discovering property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn discovering(&self) -> zbus::Result<bool>;
 
     /// ExperimentalFeatures property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn experimental_features(&self) -> zbus::Result<Vec<String>>;
 
     /// Modalias property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn modalias(&self) -> zbus::Result<String>;
 
     /// Name property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn name(&self) -> zbus::Result<String>;
 
     /// Pairable property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn pairable(&self) -> zbus::Result<bool>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_pairable(&self, value: bool) -> zbus::Result<()>;
 
     /// PairableTimeout property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn pairable_timeout(&self) -> zbus::Result<u32>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_pairable_timeout(&self, value: u32) -> zbus::Result<()>;
 
     /// Powered property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn powered(&self) -> zbus::Result<bool>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_powered(&self, value: bool) -> zbus::Result<()>;
 
     /// Roles property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn roles(&self) -> zbus::Result<Vec<String>>;
 
     /// UUIDs property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn uuids(&self) -> zbus::Result<Vec<String>>;
 }
 
-#[dbus_proxy(
+#[zbus::proxy(
     interface = "org.bluez.BatteryProviderManager1",
     assume_defaults = true
 )]
@@ -139,7 +138,7 @@ trait BatteryProviderManager1 {
     ) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(interface = "org.bluez.GattManager1", assume_defaults = true)]
+#[zbus::proxy(interface = "org.bluez.GattManager1", assume_defaults = true)]
 trait GattManager1 {
     /// RegisterApplication method
     fn register_application(
@@ -155,7 +154,7 @@ trait GattManager1 {
     ) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(
+#[zbus::proxy(
     interface = "org.bluez.AdvertisementMonitorManager1",
     assume_defaults = true
 )]
@@ -167,15 +166,15 @@ trait AdvertisementMonitorManager1 {
     fn unregister_monitor(&self, application: &zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
 
     /// SupportedFeatures property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn supported_features(&self) -> zbus::Result<Vec<String>>;
 
     /// SupportedMonitorTypes property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn supported_monitor_types(&self) -> zbus::Result<Vec<String>>;
 }
 
-#[dbus_proxy(interface = "org.bluez.Media1", assume_defaults = true)]
+#[zbus::proxy(interface = "org.bluez.Media1", assume_defaults = true)]
 trait Media1 {
     /// RegisterApplication method
     fn register_application(
@@ -211,7 +210,7 @@ trait Media1 {
     fn unregister_player(&self, player: &zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(interface = "org.bluez.NetworkServer1", assume_defaults = true)]
+#[zbus::proxy(interface = "org.bluez.NetworkServer1", assume_defaults = true)]
 trait NetworkServer1 {
     /// Register method
     fn register(&self, uuid: &str, bridge: &str) -> zbus::Result<()>;
@@ -220,7 +219,7 @@ trait NetworkServer1 {
     fn unregister(&self, uuid: &str) -> zbus::Result<()>;
 }
 
-#[dbus_proxy(interface = "org.bluez.LEAdvertisingManager1", assume_defaults = true)]
+#[zbus::proxy(interface = "org.bluez.LEAdvertisingManager1", assume_defaults = true)]
 trait LEAdvertisingManager1 {
     /// RegisterAdvertisement method
     fn register_advertisement(
@@ -236,28 +235,28 @@ trait LEAdvertisingManager1 {
     ) -> zbus::Result<()>;
 
     /// ActiveInstances property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn active_instances(&self) -> zbus::Result<u8>;
 
     /// SupportedCapabilities property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn supported_capabilities(
         &self,
     ) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>>;
 
     /// SupportedFeatures property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn supported_features(&self) -> zbus::Result<Vec<String>>;
 
     /// SupportedIncludes property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn supported_includes(&self) -> zbus::Result<Vec<String>>;
 
     /// SupportedInstances property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn supported_instances(&self) -> zbus::Result<u8>;
 
     /// SupportedSecondaryChannels property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn supported_secondary_channels(&self) -> zbus::Result<Vec<String>>;
 }

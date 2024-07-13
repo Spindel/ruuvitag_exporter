@@ -387,7 +387,7 @@ mod mybus {
                 // for interface, _props in children {
                 // This will print the found paths, devices and their metadata
                 // println!("path={:?} interface={} muh={:?}", &path, interface, _props);
-                if interface.as_str() == Adapter1Proxy::INTERFACE {
+                if interface.as_str() == Adapter1Proxy::INTERFACE.unwrap() {
                     let adapter = Adapter1Proxy::builder(connection)
                         .destination("org.bluez")?
                         .path(path.clone())?
@@ -418,7 +418,7 @@ mod mybus {
             .filter_map(|(object_path, mut children)| {
                 // Children is a hashmap<Interface, Data>
                 children
-                    .remove(Device1Proxy::INTERFACE)
+                    .remove(Device1Proxy::INTERFACE.unwrap())
                     // data is HashMap<String,Value>
                     .map(|data| (object_path, data))
             })
@@ -537,7 +537,7 @@ mod mybus {
             // operation succeeded or failed. Note that `write!` uses syntax which
             // is very similar to `println!`.
 
-            let path = self.device.path();
+            let path = self.device.inner().path();
             write!(f, "MyDev(")?;
             match self.name.as_ref() {
                 Some(name) => write!(f, "name={}, ", &name)?,
@@ -567,7 +567,7 @@ mod mybus {
                 if data
                     .interfaces_and_properties
                     .iter()
-                    .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE)
+                    .any(|(interface, _)| interface == &Adapter1Proxy::INTERFACE.unwrap())
                 {
                     if let Err(err) = start_discovery(&connection).await {
                         error!(message = "Failed to start discovery on new adapter",  err=?err, data=?data);
@@ -578,7 +578,7 @@ mod mybus {
                 if data
                     .interfaces_and_properties
                     .iter()
-                    .any(|(interface, _)| interface == &Device1Proxy::INTERFACE)
+                    .any(|(interface, _)| interface == &Device1Proxy::INTERFACE.unwrap())
                 {
                     // Clone the data so we can just toss it without caring about lifetimes.
                     // The "biggest" is a string for the path.
@@ -682,7 +682,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     // Spawn event-listeners for all currently visible devices.
 
     for dev_proxy in find_devices(&connection).await? {
-        let object_path = OwnedObjectPath::from(dev_proxy.path().to_owned());
+        let object_path = OwnedObjectPath::from(dev_proxy.inner().path().to_owned());
         let device = MyDev::new(dev_proxy, tx.clone()).await?;
         pmap.insert(object_path, device);
     }

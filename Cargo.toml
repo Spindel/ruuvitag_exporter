@@ -17,7 +17,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tracing = { version = "0.1", default-features = true }
 tracing-subscriber = { version= "0.3", default-features= true}
-zbus = { version = "3", default-features = false, features = ["tokio"] }
+zbus = { version = "4", default-features = false, features = ["tokio"] }
 #futures-lite = "*"
 futures = { version = "*", default-features = false }
 

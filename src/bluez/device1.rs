@@ -20,9 +20,8 @@
 //! …consequently `zbus-xmlgen` did not generate code for the above interfaces.
 
 #![allow(non_snake_case)]
-use zbus::dbus_proxy;
 
-#[dbus_proxy(interface = "org.bluez.Device1", assume_defaults = true)]
+#[zbus::proxy(interface = "org.bluez.Device1", assume_defaults = true)]
 trait Device1 {
     /// CancelPairing method
     fn cancel_pairing(&self) -> zbus::Result<()>;
@@ -43,110 +42,110 @@ trait Device1 {
     fn pair(&self) -> zbus::Result<()>;
 
     /// Adapter property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn adapter(&self) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
     /// Address property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn address(&self) -> zbus::Result<String>;
 
     /// AddressType property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn address_type(&self) -> zbus::Result<String>;
 
     /// AdvertisingData property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn advertising_data(
         &self,
     ) -> zbus::Result<std::collections::HashMap<u8, zbus::zvariant::OwnedValue>>;
 
     /// AdvertisingFlags property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn advertising_flags(&self) -> zbus::Result<Vec<u8>>;
 
     /// Alias property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn alias(&self) -> zbus::Result<String>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_alias(&self, value: &str) -> zbus::Result<()>;
 
     /// Appearance property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn appearance(&self) -> zbus::Result<u16>;
 
     /// Blocked property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn blocked(&self) -> zbus::Result<bool>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_blocked(&self, value: bool) -> zbus::Result<()>;
 
     /// Bonded property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn bonded(&self) -> zbus::Result<bool>;
 
     /// Class property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn class(&self) -> zbus::Result<u32>;
 
     /// Connected property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn connected(&self) -> zbus::Result<bool>;
 
     /// Icon property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn icon(&self) -> zbus::Result<String>;
 
     /// LegacyPairing property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn legacy_pairing(&self) -> zbus::Result<bool>;
 
     /// ManufacturerData property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn manufacturer_data(&self) -> zbus::Result<std::collections::HashMap<u16, std::vec::Vec<u8>>>;
 
     /// Modalias property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn modalias(&self) -> zbus::Result<String>;
 
     /// Name property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn name(&self) -> zbus::Result<String>;
 
     /// Paired property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn paired(&self) -> zbus::Result<bool>;
 
     /// RSSI property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn rssi(&self) -> zbus::Result<i16>;
 
     /// ServiceData property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn service_data(
         &self,
     ) -> zbus::Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>>;
 
     /// ServicesResolved property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn services_resolved(&self) -> zbus::Result<bool>;
 
     /// Trusted property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn trusted(&self) -> zbus::Result<bool>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_trusted(&self, value: bool) -> zbus::Result<()>;
 
     /// TxPower property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn tx_power(&self) -> zbus::Result<i16>;
 
     /// UUIDs property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn uuids(&self) -> zbus::Result<Vec<String>>;
 
     /// WakeAllowed property
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn wake_allowed(&self) -> zbus::Result<bool>;
-    #[dbus_proxy(property)]
+    #[zbus(property)]
     fn set_wake_allowed(&self, value: bool) -> zbus::Result<()>;
 }
