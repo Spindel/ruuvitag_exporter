@@ -11,7 +11,8 @@ tokio-stream = { version = "0.1", default-features = false }
 ruuvi-sensor-protocol = { version = "0.6.0", default-features = false }
 prometheus = { version = "0.13", default-features = false }
 lazy_static = "1.4"
-hyper = { version = "0.14", features = ["server", "http1", "tcp"]}
+# hyper = { version = "0.14", features = ["server", "http1", "runtime", "backports", "deprecated"]}
+hyper = { version = "0.14", features = ["full", "backports", "deprecated"]}
 tracing = { version = "0.1", default-features = true }
 tracing-subscriber = { version= "0.3", default-features= true}
 zbus = { version = "3", default-features = false, features = ["tokio"] }
