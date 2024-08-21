@@ -73,7 +73,7 @@ impl From<Address> for sys::bdaddr_t {
 
 /// Invalid Bluetooth address error.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// #[derive(serde::Serialize, serde::Deserialize)]
 pub struct InvalidAddress(pub String);
 
 impl fmt::Display for InvalidAddress {
@@ -111,7 +111,7 @@ impl From<Address> for [u8; 6] {
     }
 }
 
-#[cfg(feature = "serde")]
+/*
 impl serde::Serialize for Address {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -121,7 +121,6 @@ impl serde::Serialize for Address {
     }
 }
 
-#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Address {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -132,3 +131,4 @@ impl<'de> serde::Deserialize<'de> for Address {
         s.parse().map_err(|err| D::Error::custom(&err))
     }
 }
+*/
