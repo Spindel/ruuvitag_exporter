@@ -1,17 +1,27 @@
 [package]
 name = "ruuvitag_exporter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-btleplug = { version = "0.9" }
 tokio = { version = "1", features = ["time", "sync", "rt", "macros", "rt-multi-thread"] }
-tokio-stream = "0.1"
-ruuvi-sensor-protocol = "0.5.0"
+tokio-stream = { version = "0.1", default-features = false }
+ruuvi-sensor-protocol = { version = "0.6.0", default-features = false }
 prometheus = { version = "0.13", default-features = false }
 lazy_static = "1.4"
-hyper = { version = "0.14", features = ["server", "http1", "tcp"]}
-tracing = "0.1"
-tracing-subscriber = "0.3"
+# hyper = { version = "0.14", features = ["server", "http1", "runtime", "backports", "deprecated"]}
+hyper = { version = "1", features = ["http1", "server"]}
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tracing = { version = "0.1", default-features = true }
+tracing-subscriber = { version= "0.3", default-features= true}
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+#futures-lite = "*"
+futures = { version = "*", default-features = false }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
