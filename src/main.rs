@@ -76,7 +76,7 @@ mod prom {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub(crate) async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
+    pub async fn sensor_processor(mut rx: mpsc::Receiver<SensorValues>) {
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         // Shouldn't this be easier?
         // The flow here looks really convoluted in my opinion.
@@ -287,7 +287,7 @@ mod serve {
     }
 
     #[tracing::instrument]
-    pub(crate) async fn webserver(addr: SocketAddr) {
+    pub async fn webserver(addr: SocketAddr) {
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
                 info!(message = "Listening on ", %addr);
@@ -472,7 +472,7 @@ mod mybus {
         pub async fn new(
             device: Device1Proxy<'static>,
             tx: mpsc::Sender<SensorValues>,
-        ) -> zbus::Result<MyDev<'static>> {
+        ) -> zbus::Result<Self> {
             let address = device.address().await.ok();
             let name = device.name().await.ok();
             if name.is_some() {
@@ -508,7 +508,7 @@ mod mybus {
             connection: &zbus::Connection,
             object_path: OwnedObjectPath,
             tx: mpsc::Sender<SensorValues>,
-        ) -> zbus::Result<MyDev<'static>> {
+        ) -> zbus::Result<Self> {
             let dev_proxy = Device1Proxy::builder(connection)
                 .destination("org.bluez")?
                 .path(object_path)?
@@ -521,7 +521,7 @@ mod mybus {
         // Tell the tracing infra to use Display formating of "self" as the "device" field.
         #[tracing::instrument(skip(self), fields(device = %self))]
         async fn bye(self) {
-            let _ = &self.listener.abort();
+            let () = &self.listener.abort();
             if (self.listener.await).is_ok() {
                 warn!(message = "Unexpectedly task succeeded before being aborted");
             }
@@ -699,7 +699,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
     if let Some(task_result) = futs.next().await {
         error!("Something ended and I do not know what or why.");
         match task_result {
-            Ok(_) => warn!(message = "Task ended succesfully"),
+            Ok(()) => warn!(message = "Task ended succesfully"),
             Err(err) => error!(message = "Task ended badly.", err = ?err),
         }
     }
