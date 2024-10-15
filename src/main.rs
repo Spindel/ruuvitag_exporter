@@ -133,7 +133,7 @@ mod prom {
             return;
         };
         // Tracing has a hard time with String, this wraps it as a borrowed value
-        span.record("mac", &tracing::field::display(&mac));
+        span.record("mac", tracing::field::display(&mac));
 
         COUNT.with_label_values(&[&mac]).inc();
         if let Some(humidity) = sensor.humidity_as_ppm() {
